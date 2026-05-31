@@ -49,6 +49,7 @@ const wsConnectLimiter = new FixedWindowRateLimiter({
 });
 const activeWsByIp = new Map<string, number>();
 const maxWsPerIp = parseEnvInt("MAX_WS_PER_IP", 20);
+const noIndexPaths = new Set(["/legal-notice", "/privacy-policy"]);
 
 const mimeTypes: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
@@ -62,6 +63,11 @@ const mimeTypes: Record<string, string> = {
 
 function pathname(reqUrl: string | undefined): string {
   return new URL(reqUrl ?? "/", "http://localhost").pathname;
+}
+
+function isNoIndexPath(path: string): boolean {
+  const normalizedPath = path.length > 1 && path.endsWith("/") ? path.slice(0, -1) : path;
+  return noIndexPaths.has(normalizedPath);
 }
 
 function rateLimit(res: import("node:http").ServerResponse, limiter: FixedWindowRateLimiter, key: string): boolean {
@@ -208,7 +214,17 @@ async function serveStatic(reqUrl: string | undefined, res: import("node:http").
   }
 
   const filePath = await stat(safeCandidate)
-    .then((fileStat) => (fileStat.isFile() ? safeCandidate : join(frontendDistDir, "index.html")))
+    .then((fileStat) => {
+      if (fileStat.isFile()) {
+        return safeCandidate;
+      }
+
+      if (fileStat.isDirectory()) {
+        return join(safeCandidate, "index.html");
+      }
+
+      return join(frontendDistDir, "index.html");
+    })
     .catch(() => join(frontendDistDir, "index.html"));
 
   try {
@@ -219,7 +235,8 @@ async function serveStatic(reqUrl: string | undefined, res: import("node:http").
 
   res.writeHead(200, {
     "Content-Type": mimeTypes[extname(filePath)] ?? "application/octet-stream",
-    "Cache-Control": filePath.endsWith("index.html") ? "no-cache" : "public, max-age=31536000, immutable"
+    "Cache-Control": filePath.endsWith("index.html") ? "no-cache" : "public, max-age=31536000, immutable",
+    ...(isNoIndexPath(requestedPath) ? { "X-Robots-Tag": "noindex, nofollow, noarchive" } : {})
   });
   createReadStream(filePath).pipe(res);
   return true;

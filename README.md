@@ -1,92 +1,134 @@
 # Pixel Fleet
 
-Pixel Fleet is a browser multiplayer Battleship game with passwordless guest accounts, server-authoritative game rules, WebSocket matchmaking, SQLite persistence, and an 8-bit/pixel-art React UI.
+Pixel Fleet is an 8-bit browser multiplayer Battleship game. It combines guest accounts, real-time WebSocket matchmaking,
+server-authoritative game rules, persistent stats, and a compact pixel-art React UI.
 
-## Project Layout
+## Features
 
-- `apps/backend`: Node.js HTTP/WebSocket server, guest sessions, SQLite persistence, matchmaking, match state.
-- `apps/frontend`: Vite + React client with local 8-bit component wrappers inspired by 8bitcn/21st.dev.
-- `packages/shared`: Pure, testable Battleship rules, XP/level helpers, and shared types.
-- `tests`: Vitest coverage for the shared game rules.
+- Real-time multiplayer Battleship matches.
+- Passwordless guest accounts backed by HttpOnly session cookies.
+- Server-authoritative ship placement, shots, turn handling, and match results.
+- XP, levels, win/loss stats, hit rate, and ships-sunk tracking.
+- WebSocket reconnection handling for active matches.
+- SQLite persistence with hashed session tokens.
+- Built-in public-playtest hardening: rate limits, origin checks, security headers, and admin-only metrics.
+- Configurable Legal Notice and Privacy Policy pages for public deployments.
 
-## Run
+## Tech Stack
+
+- **Frontend:** React 19, Vite, TypeScript, CSS.
+- **Backend:** Node.js 24, native HTTP server, WebSocket server, built-in SQLite.
+- **Shared package:** TypeScript game rules, XP helpers, and shared message types.
+- **Tests:** Vitest.
+
+## Repository Layout
+
+```text
+apps/backend      Node.js HTTP/WebSocket server, matchmaking, persistence, admin endpoints
+apps/frontend     Vite + React client and pixel-art UI
+packages/shared   Shared Battleship rules, XP helpers, and TypeScript types
+scripts           Maintenance, smoke-test, and admin CLI helpers
+tests             Vitest coverage for game and server behavior
+```
+
+## Getting Started
+
+Pixel Fleet requires Node.js 24 or newer.
 
 ```bash
 npm install
 npm run dev
 ```
 
-Frontend: `http://localhost:5173`
+Local development URLs:
 
-Backend API/WebSocket: `http://localhost:3001`
+- Frontend: `http://localhost:5173`
+- Backend API/WebSocket: `http://localhost:3001`
 
-The Vite dev server proxies `/api` and `/ws` to the backend so HttpOnly guest-session cookies work in local development.
+The Vite dev server proxies `/api` and `/ws` to the backend so guest-session cookies work from the local frontend
+origin.
 
-## Production
+## Useful Scripts
 
 ```bash
-npm install
-npm start
+npm run dev          # start backend and frontend for local development
+npm run build        # build shared package, backend, and frontend
+npm run start        # build and run the production server
+npm run test         # run Vitest tests
+npm run typecheck    # run TypeScript project checks
+npm run smoke:match  # run a basic end-to-end match smoke test
 ```
 
-`npm start` builds the shared package, backend, and frontend, then starts one Node.js server. The server:
+## Configuration
 
-- listens on `process.env.PORT` when provided by the host,
-- serves the built React app from `apps/frontend/dist`,
-- exposes `/api/*` and `/ws` from the same origin, which keeps cookies and WebSockets simple behind HTTPS.
+Backend runtime configuration:
 
-For Infomaniak Node.js hosting, select Node.js 24 or newer because the backend uses Node's built-in SQLite module. If your plan only offers older Node versions, migrate the persistence layer to Infomaniak's MariaDB/MySQL before going public.
+| Variable            | Purpose                                                                           |
+|---------------------|-----------------------------------------------------------------------------------|
+| `PORT`              | HTTP/WebSocket server port.                                                       |
+| `DATABASE_PATH`     | Optional SQLite file path for persistent hosting.                                 |
+| `FRONTEND_ORIGIN`   | Optional extra CORS origin for split frontend/backend deployments.                |
+| `FRONTEND_DIST_DIR` | Optional override for the built frontend directory.                               |
+| `ADMIN_TOKEN`       | Enables protected admin and metrics endpoints.                                    |
+| `TRUST_PROXY`       | Defaults to `true`; set to `false` when no trusted proxy sets forwarding headers. |
 
-Useful environment variables:
+Legal page details are configured at frontend build time with `VITE_LEGAL_*` variables. The public repository keeps only
+placeholders in `apps/frontend/.env.example`; real contact details should be provided through deployment secrets or an
+uncommitted `apps/frontend/.env.production` file.
 
-- `PORT`: hosting-assigned port.
-- `DATABASE_PATH`: optional SQLite file path. Choose a persistent writable path on the host.
-- `FRONTEND_ORIGIN`: optional extra CORS origin for split frontend/backend deployments.
-- `FRONTEND_DIST_DIR`: optional override for the built frontend directory.
-- `ADMIN_TOKEN`: enables protected admin and metrics endpoints.
-- `TRUST_PROXY`: defaults to `true`; set to `false` only when the Node process is directly exposed and no trusted reverse proxy sets `X-Forwarded-For`.
+## Production Deployment
 
-## Public-Hosting Hardening
+`npm start` builds the workspace and starts one Node.js server. The production server serves the built React app from
+`apps/frontend/dist` and exposes `/api/*` and `/ws` from the same origin.
 
-The server includes single-process hardening suitable for small public playtests:
+For public deployments:
+
+- Use Node.js 24 or newer.
+- Store the SQLite database on persistent storage by setting `DATABASE_PATH`.
+- Set `ADMIN_TOKEN` before exposing admin endpoints.
+- Set the `VITE_LEGAL_*` variables during the frontend build so the hosted legal pages contain the correct public
+  operator and privacy details.
+- Keep private `.env*` files out of Git. The repository intentionally tracks only `.env.example` files.
+
+The production build emits static `/legal-notice/` and `/privacy-policy/` HTML shells with `noindex` robots metadata.
+The Node production server also sends `X-Robots-Tag: noindex, nofollow, noarchive` for `/legal-notice` and
+`/privacy-policy`.
+
+## Public-Playtest Hardening
+
+Pixel Fleet includes conservative single-process safeguards:
 
 - HTTP rate limit: `HTTP_REQUESTS_PER_MINUTE` (default `240` per IP).
 - Guest account creation limit: `GUEST_LOGINS_PER_HOUR` (default `12` per IP).
 - WebSocket connect limit: `WS_CONNECTS_PER_MINUTE` (default `30` per IP).
 - Active WebSocket cap: `MAX_WS_PER_IP` (default `20` per IP).
-- WebSocket action limits: `WS_MESSAGES_PER_10S` (default `120`), `QUEUE_ACTIONS_PER_MINUTE` (default `12`), `FIRE_ACTIONS_PER_10S` (default `120`).
-- Request body cap and WebSocket payload cap: `MAX_WS_PAYLOAD_BYTES` defaults to `4096`.
+- WebSocket action limits: `WS_MESSAGES_PER_10S`, `QUEUE_ACTIONS_PER_MINUTE`, and `FIRE_ACTIONS_PER_10S`.
+- Request body and WebSocket payload caps.
 - Origin checks for state-changing HTTP requests and WebSocket upgrades.
 - Security headers for the production server.
 
-Monitoring:
+Monitoring endpoints:
 
-- Public health: `GET /api/health`.
-- Admin JSON status: `GET /api/admin/status`.
-- Admin JSON metrics: `GET /api/admin/metrics`.
-- Admin Prometheus metrics: `GET /metrics`.
+- `GET /api/health`
+- `GET /api/admin/status`
+- `GET /api/admin/metrics`
+- `GET /metrics`
 
-Admin CLI:
+Admin endpoints require `ADMIN_TOKEN`.
 
-```bash
-ADMIN_TOKEN=change-me PIXELFLEET_URL=https://your-domain.example npm run admin -- status
-ADMIN_TOKEN=change-me PIXELFLEET_URL=https://your-domain.example npm run admin -- metrics
-ADMIN_TOKEN=change-me PIXELFLEET_URL=https://your-domain.example npm run admin -- reset runtime --yes
-ADMIN_TOKEN=change-me PIXELFLEET_URL=https://your-domain.example npm run admin -- reset sessions --yes
-ADMIN_TOKEN=change-me PIXELFLEET_URL=https://your-domain.example npm run admin -- reset stats --yes
-ADMIN_TOKEN=change-me PIXELFLEET_URL=https://your-domain.example npm run admin -- reset accounts --yes
-```
+## Data Model Notes
 
-Reset scopes:
-
-- `runtime`: clears queue, active matches, sockets and in-memory limit state.
-- `sessions`: invalidates guest sessions and clears runtime state.
-- `stats`: resets XP and stats while keeping guest accounts.
-- `accounts`: deletes all guest accounts and sessions.
-
-## Notes
-
-- Guest login never looks up users by username. Usernames are display names only.
+- Usernames are display names only; guest login never looks up users by username.
 - Session cookies store a random token; the database stores only a SHA-256 token hash.
-- Deleting cookies/browser data loses access to the guest account by design.
-- The client never receives hidden enemy ship positions. Shots and match transitions are validated on the server.
+- Clearing browser cookies loses access to the guest account.
+- Hidden enemy ship positions are never sent to the client.
+- Shots and match transitions are validated on the server.
+
+## Contributing
+
+Bug reports, small improvements, and focused pull requests are welcome. For larger changes, opening an issue first keeps
+the discussion easy to follow.
+
+## License
+
+No open-source license has been added yet.

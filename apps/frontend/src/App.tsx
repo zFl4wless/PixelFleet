@@ -7,10 +7,24 @@ import { LoginScreen } from "./components/LoginScreen";
 import { Matchmaking } from "./components/Matchmaking";
 import { ResultScreen } from "./components/ResultScreen";
 import { EightBitSkeleton, EightBitToastViewport } from "./components/8bit";
+import { LegalFooter, LegalPage, type LegalPageKind } from "./components/legal/LegalPages";
 
 type Toast = { id: string; tone: "default" | "success" | "warning" | "danger" | "info"; message: string };
 
+function legalPageFromPath(pathname: string): LegalPageKind | null {
+  if (pathname === "/legal-notice") {
+    return "legal-notice";
+  }
+
+  if (pathname === "/privacy-policy") {
+    return "privacy-policy";
+  }
+
+  return null;
+}
+
 export default function App() {
+  const legalPage = legalPageFromPath(window.location.pathname);
   const [profile, setProfile] = useState<PlayerProfile | null>(null);
   const [loading, setLoading] = useState(true);
   const [socketConnected, setSocketConnected] = useState(false);
@@ -29,10 +43,14 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (legalPage) {
+      return;
+    }
+
     fetchMe()
       .then(setProfile)
       .finally(() => setLoading(false));
-  }, []);
+  }, [legalPage]);
 
   useEffect(() => {
     if (!profile) {
@@ -127,6 +145,10 @@ export default function App() {
     setQueued(false);
   }
 
+  if (legalPage) {
+    return <LegalPage page={legalPage} />;
+  }
+
   if (loading) {
     return (
       <main className="app-screen center-screen">
@@ -160,6 +182,7 @@ export default function App() {
       ) : (
         <Lobby profile={profile} connected={socketConnected} onStart={() => send({ type: "join_queue" })} onLogout={logout} />
       )}
+      <LegalFooter />
       <EightBitToastViewport
         toasts={toasts}
         onDismiss={(id) => setToasts((current) => current.filter((toast) => toast.id !== id))}

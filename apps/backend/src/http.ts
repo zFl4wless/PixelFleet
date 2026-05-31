@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 const SESSION_COOKIE_NAME = "pf_session";
 const ONE_YEAR_SECONDS = 60 * 60 * 24 * 365;
 const DEFAULT_MAX_JSON_BYTES = 16 * 1024;
+const VITE_DEV_PORTS = new Set(["5173", "5174", "5175", "5176", "5177", "5178", "5179"]);
 
 export function parseCookies(header: string | undefined): Record<string, string> {
   if (!header) {
@@ -66,36 +67,84 @@ export function setSecurityHeaders(res: ServerResponse): void {
   );
 }
 
+function configuredFrontendOrigins(): string[] {
+  return (process.env.FRONTEND_ORIGIN ?? "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+}
+
+function normalizeHostname(hostname: string): string {
+  return hostname.toLowerCase().replace(/^\[(.*)\]$/, "$1");
+}
+
+function isPrivateIpv4(hostname: string): boolean {
+  const octets = hostname.split(".").map((part) => Number(part));
+  if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) {
+    return false;
+  }
+
+  const [a, b] = octets;
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 169 && b === 254)
+  );
+}
+
+function isLocalOrPrivateHostname(hostname: string): boolean {
+  const normalized = normalizeHostname(hostname);
+  return (
+    normalized === "localhost" ||
+    normalized.endsWith(".localhost") ||
+    normalized === "::1" ||
+    normalized === "0:0:0:0:0:0:0:1" ||
+    normalized.startsWith("fe80:") ||
+    normalized.startsWith("fc") ||
+    normalized.startsWith("fd") ||
+    isPrivateIpv4(normalized)
+  );
+}
+
+function isViteDevOrigin(origin: string): boolean {
+  if (process.env.NODE_ENV === "production") {
+    return false;
+  }
+
+  try {
+    const url = new URL(origin);
+    return (url.protocol === "http:" || url.protocol === "https:") && VITE_DEV_PORTS.has(url.port) && isLocalOrPrivateHostname(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+export function isAllowedOrigin(origin: string, host: string | undefined): boolean {
+  const allowedOrigins = new Set([
+    host ? `https://${host}` : "",
+    host ? `http://${host}` : "",
+    ...configuredFrontendOrigins()
+  ]);
+
+  return allowedOrigins.has(origin) || isViteDevOrigin(origin);
+}
+
 export function isTrustedOrigin(req: IncomingMessage): boolean {
   const origin = req.headers.origin;
   if (!origin) {
     return true;
   }
 
-  const host = req.headers.host;
-  const forwardedProto = req.headers["x-forwarded-proto"];
-  const inferredProto = forwardedProto === "https" || isSecureRequest(req) ? "https" : "http";
-  const allowedOrigins = new Set([
-    host ? `${inferredProto}://${host}` : "",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    process.env.FRONTEND_ORIGIN ?? ""
-  ]);
-
-  return allowedOrigins.has(origin);
+  return isAllowedOrigin(origin, req.headers.host);
 }
 
 export function setCors(req: IncomingMessage, res: ServerResponse): void {
   const origin = req.headers.origin;
-  const allowedOrigins = new Set([
-    req.headers.host ? `https://${req.headers.host}` : "",
-    req.headers.host ? `http://${req.headers.host}` : "",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    process.env.FRONTEND_ORIGIN ?? ""
-  ]);
 
-  if (origin && allowedOrigins.has(origin)) {
+  if (origin && isAllowedOrigin(origin, req.headers.host)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Credentials", "true");

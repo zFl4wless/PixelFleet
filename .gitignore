@@ -1,6 +1,9 @@
 node_modules
 dist
 .vite
+.env*
+!.env.example
+!apps/*/.env.example
 coverage
 *.sqlite
 *.sqlite-shm
