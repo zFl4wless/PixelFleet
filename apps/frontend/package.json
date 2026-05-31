@@ -1,0 +1,16 @@
+{
+  "name": "@pixelfleet/frontend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc -p tsconfig.json && vite build",
+    "preview": "vite preview --host 0.0.0.0"
+  },
+  "dependencies": {
+    "@pixelfleet/shared": "1.0.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "@pixelfleet/backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@pixelfleet/shared": "1.0.0",
+    "ws": "^8.18.0"
+  }
+}

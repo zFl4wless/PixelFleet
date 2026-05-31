@@ -1,0 +1,43 @@
+{
+  "name": "pixelfleet",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pixel Fleet - 8-bit browser multiplayer Battleship with guest accounts.",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "predev": "npm run build -w packages/shared",
+    "dev": "concurrently -n backend,frontend -c blue,cyan \"npm run dev -w apps/backend\" \"npm run dev -w apps/frontend\"",
+    "predev:backend": "npm run build -w packages/shared",
+    "dev:backend": "npm run dev -w apps/backend",
+    "predev:frontend": "npm run build -w packages/shared",
+    "dev:frontend": "npm run dev -w apps/frontend",
+    "clean": "node scripts/clean.mjs",
+    "build": "npm run build -w packages/shared && npm run build -w apps/backend && npm run build -w apps/frontend",
+    "prestart": "npm run build",
+    "start": "node apps/backend/dist/server.js",
+    "typecheck": "tsc -b",
+    "pretest": "npm run build -w packages/shared",
+    "test": "vitest run",
+    "smoke:match": "node scripts/smoke-match.mjs",
+    "admin": "node scripts/admin.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.15",
+    "@types/react-dom": "^19.2.3",
+    "@types/ws": "^8.5.13",
+    "@vitejs/plugin-react": "^5.0.0",
+    "concurrently": "^9.1.2",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.3",
+    "vite": "^7.0.0",
+    "vitest": "^3.2.0"
+  }
+}

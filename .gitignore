@@ -1,0 +1,13 @@
+node_modules
+dist
+.vite
+coverage
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.tsbuildinfo
+.DS_Store
+.idea
+apps/backend/data/*
+!apps/backend/data/.gitkeep
+.idea
