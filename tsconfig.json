@@ -3,6 +3,7 @@
   "references": [
     { "path": "./packages/shared" },
     { "path": "./apps/backend" },
-    { "path": "./apps/frontend" }
+    { "path": "./apps/frontend" },
+    { "path": "./apps/frontend/tsconfig.node.json" }
   ]
 }
