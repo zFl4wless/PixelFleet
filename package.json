@@ -22,6 +22,7 @@
     "build": "npm run build -w packages/shared && npm run build -w apps/backend && npm run build -w apps/frontend",
     "prestart": "npm run build",
     "start": "node apps/backend/dist/server.js",
+    "serve": "node apps/backend/dist/server.js",
     "typecheck": "tsc -b",
     "pretest": "npm run build -w packages/shared",
     "test": "vitest run",

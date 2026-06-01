@@ -128,7 +128,15 @@ export class GameHub {
     this.removeFromQueue(userId);
 
     const match = this.findMatchForUser(userId);
-    if (!match || match.phase === "finished") {
+    if (!match) {
+      return;
+    }
+
+    if (match.phase === "finished") {
+      match.leftAfterFinish.add(userId);
+      if (match.leftAfterFinish.size === match.players.length) {
+        this.matches.delete(match.id);
+      }
       return;
     }
 

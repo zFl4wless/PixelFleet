@@ -54,6 +54,7 @@ origin.
 npm run dev          # start backend and frontend for local development
 npm run build        # build shared package, backend, and frontend
 npm run start        # build and run the production server
+npm run serve        # run the already-built production server
 npm run test         # run Vitest tests
 npm run typecheck    # run TypeScript project checks
 npm run smoke:match  # run a basic end-to-end match smoke test
@@ -78,8 +79,9 @@ uncommitted `apps/frontend/.env.production` file.
 
 ## Production Deployment
 
-`npm start` builds the workspace and starts one Node.js server. The production server serves the built React app from
-`apps/frontend/dist` and exposes `/api/*` and `/ws` from the same origin.
+`npm start` builds the workspace and starts one Node.js server. In hosted environments with a separate build step, use
+`npm run serve` as the start command so restarts do not rebuild the project. The production server serves the built React
+app from `apps/frontend/dist` and exposes `/api/*` and `/ws` from the same origin.
 
 For public deployments:
 
@@ -131,4 +133,4 @@ the discussion easy to follow.
 
 ## License
 
-No open-source license has been added yet.
+Pixel Fleet is released under the MIT License. See `LICENSE`.
