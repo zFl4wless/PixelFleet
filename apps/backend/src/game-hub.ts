@@ -640,7 +640,7 @@ export class GameHub {
     };
   }
 
-  resetRuntime(): HubStats {
+  resetRuntime(closeCode = 4009, closeReason = "Admin reset"): HubStats {
     for (const match of this.matches.values()) {
       for (const timer of match.reconnectTimers.values()) {
         clearTimeout(timer);
@@ -648,7 +648,7 @@ export class GameHub {
     }
 
     for (const connection of this.connections.values()) {
-      connection.ws.close(4009, "Admin reset");
+      connection.ws.close(closeCode, closeReason);
     }
 
     this.connections.clear();

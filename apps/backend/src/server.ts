@@ -4,6 +4,7 @@ import { stat } from "node:fs/promises";
 import { extname, join, normalize, sep } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import {
+  closeDatabase,
   createGuestAccount,
   deleteSession,
   getDatabaseStats,
@@ -31,6 +32,15 @@ const port = Number(process.env.PORT ?? 3001);
 const hub = new GameHub();
 const frontendDistDir = process.env.FRONTEND_DIST_DIR ?? join(process.cwd(), "apps/frontend/dist");
 const adminToken = process.env.ADMIN_TOKEN;
+let shuttingDown = false;
+
+// A production container must not become healthy without the built frontend.
+if (process.env.NODE_ENV === "production") {
+  const index = await stat(join(frontendDistDir, "index.html"));
+  if (!index.isFile()) {
+    throw new Error("Production frontend index.html is missing. Run npm run build first.");
+  }
+}
 const publicLimiter = new FixedWindowRateLimiter({
   limit: parseEnvInt("HTTP_REQUESTS_PER_MINUTE", 240),
   windowMs: 60_000
@@ -256,6 +266,17 @@ const server = createServer(async (req, res) => {
   }
 
   try {
+    // Container probes must remain available when a visitor hits their rate limit.
+    if (req.method === "GET" && path === "/api/health") {
+      sendJson(res, shuttingDown ? 503 : 200, {
+        ok: !shuttingDown,
+        name: "Pixel Fleet",
+        uptimeSeconds: Math.round(process.uptime()),
+        hub: hub.stats()
+      });
+      return;
+    }
+
     if (rateLimit(res, publicLimiter, `http:${ip}`)) {
       return;
     }
@@ -267,16 +288,6 @@ const server = createServer(async (req, res) => {
     }
 
     if (await handleAdminRoute(req, res, path, ip)) {
-      return;
-    }
-
-    if (req.method === "GET" && path === "/api/health") {
-      sendJson(res, 200, {
-        ok: true,
-        name: "Pixel Fleet",
-        uptimeSeconds: Math.round(process.uptime()),
-        hub: hub.stats()
-      });
       return;
     }
 
@@ -347,7 +358,7 @@ const heartbeatInterval = setInterval(() => {
 server.on("close", () => clearInterval(heartbeatInterval));
 
 server.on("upgrade", (req, socket, head) => {
-  if (!req.url?.startsWith("/ws")) {
+  if (shuttingDown || !req.url?.startsWith("/ws")) {
     socket.destroy();
     return;
   }
@@ -401,6 +412,45 @@ server.on("upgrade", (req, socket, head) => {
   });
 });
 
-server.listen(port, () => {
-  console.log(`Pixel Fleet backend listening on http://localhost:${port}`);
+function shutdown(signal: string): void {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  console.log(`Received ${signal}; stopping Pixel Fleet.`);
+  clearInterval(heartbeatInterval);
+
+  const timeout = setTimeout(() => {
+    console.error("Shutdown timed out.");
+    process.exit(1);
+  }, 10_000);
+  timeout.unref();
+
+  // Clear reconnect timers before closing sockets, so redeploys cannot cause forfeits.
+  hub.resetRuntime(1012, "Server restarting");
+  // Also close superseded sockets that are no longer tracked by the hub.
+  for (const ws of wss.clients) {
+    ws.close(1012, "Server restarting");
+  }
+
+  Promise.all([
+    new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+    new Promise<void>((resolve, reject) => wss.close((error) => error ? reject(error) : resolve()))
+  ]).then(() => {
+    closeDatabase();
+    clearTimeout(timeout);
+    process.exit(0);
+  }).catch((error) => {
+    console.error("Shutdown failed:", error);
+    process.exit(1);
+  });
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+server.listen(port, "0.0.0.0", () => {
+  const address = server.address();
+  const listeningPort = address && typeof address !== "string" ? address.port : port;
+  console.log(`Pixel Fleet backend listening on http://0.0.0.0:${listeningPort}`);
 });

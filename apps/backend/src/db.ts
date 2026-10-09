@@ -74,6 +74,10 @@ db.exec(`
   );
 `);
 
+export function closeDatabase(): void {
+  db.close();
+}
+
 function now(): string {
   return new Date().toISOString();
 }

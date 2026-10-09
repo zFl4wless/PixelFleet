@@ -1,0 +1,55 @@
+services:
+  pixelfleet:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_LEGAL_PROVIDER_NAME: ${VITE_LEGAL_PROVIDER_NAME:-}
+        VITE_LEGAL_PROVIDER_ADDRESS: ${VITE_LEGAL_PROVIDER_ADDRESS:-}
+        VITE_LEGAL_PROVIDER_EMAIL: ${VITE_LEGAL_PROVIDER_EMAIL:-}
+        VITE_LEGAL_REPRESENTED_BY: ${VITE_LEGAL_REPRESENTED_BY:-}
+        VITE_LEGAL_VAT_ID: ${VITE_LEGAL_VAT_ID:-}
+        VITE_LEGAL_CONTENT_RESPONSIBLE: ${VITE_LEGAL_CONTENT_RESPONSIBLE:-}
+        VITE_LEGAL_DPO: ${VITE_LEGAL_DPO:-}
+        VITE_LEGAL_HOSTING_PROVIDER: ${VITE_LEGAL_HOSTING_PROVIDER:-}
+        VITE_LEGAL_HOSTING_REGION: ${VITE_LEGAL_HOSTING_REGION:-}
+        VITE_LEGAL_HOSTING_DPA: ${VITE_LEGAL_HOSTING_DPA:-}
+        VITE_LEGAL_LOG_RETENTION: ${VITE_LEGAL_LOG_RETENTION:-}
+        VITE_LEGAL_ACCOUNT_RETENTION: ${VITE_LEGAL_ACCOUNT_RETENTION:-}
+    environment:
+      NODE_ENV: production
+      PORT: "3001"
+      DATABASE_PATH: /app/data/pixelfleet.sqlite
+      TRUST_PROXY: "true"
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      HTTP_REQUESTS_PER_MINUTE: ${HTTP_REQUESTS_PER_MINUTE:-240}
+      GUEST_LOGINS_PER_HOUR: ${GUEST_LOGINS_PER_HOUR:-12}
+      ADMIN_REQUESTS_PER_MINUTE: ${ADMIN_REQUESTS_PER_MINUTE:-60}
+      WS_CONNECTS_PER_MINUTE: ${WS_CONNECTS_PER_MINUTE:-30}
+      MAX_WS_PER_IP: ${MAX_WS_PER_IP:-20}
+      WS_MESSAGES_PER_10S: ${WS_MESSAGES_PER_10S:-120}
+      QUEUE_ACTIONS_PER_MINUTE: ${QUEUE_ACTIONS_PER_MINUTE:-12}
+      FIRE_ACTIONS_PER_10S: ${FIRE_ACTIONS_PER_10S:-120}
+      MAX_WS_PAYLOAD_BYTES: ${MAX_WS_PAYLOAD_BYTES:-4096}
+    expose:
+      - "3001"
+    volumes:
+      - pixelfleet-data:/app/data
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 15s
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Dokploy adds the Traefik network and routing labels through its Domains tab.
+# Do not publish a host port or scale this service: matchmaking lives in memory.
+volumes:
+  pixelfleet-data:

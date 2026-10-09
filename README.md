@@ -53,7 +53,7 @@ origin.
 ```bash
 npm run dev          # start backend and frontend for local development
 npm run build        # build shared package, backend, and frontend
-npm run start        # build and run the production server
+npm run start        # build and run the server locally
 npm run serve        # run the already-built production server
 npm run test         # run Vitest tests
 npm run typecheck    # run TypeScript project checks
@@ -67,30 +67,31 @@ Backend runtime configuration:
 | Variable            | Purpose                                                                           |
 |---------------------|-----------------------------------------------------------------------------------|
 | `PORT`              | HTTP/WebSocket server port.                                                       |
-| `DATABASE_PATH`     | Optional SQLite file path for persistent hosting.                                 |
-| `FRONTEND_ORIGIN`   | Optional extra CORS origin for split frontend/backend deployments.                |
-| `FRONTEND_DIST_DIR` | Optional override for the built frontend directory.                               |
+| `DATABASE_PATH`     | SQLite file path; Dokploy uses `/app/data/pixelfleet.sqlite` on a named volume.    |
+| `FRONTEND_ORIGIN`   | Optional extra allowed origin for local tooling; not needed in Dokploy.          |
+| `FRONTEND_DIST_DIR` | Optional frontend directory override for local tooling.                           |
 | `ADMIN_TOKEN`       | Enables protected admin and metrics endpoints.                                    |
 | `TRUST_PROXY`       | Defaults to `true`; set to `false` when no trusted proxy sets forwarding headers. |
 
-Legal page details are configured at frontend build time with `VITE_LEGAL_*` variables. The public repository keeps only
-placeholders in `apps/frontend/.env.example`; real contact details should be provided through deployment secrets or an
-uncommitted `apps/frontend/.env.production` file.
+Legal page details are configured at frontend build time with public `VITE_LEGAL_*` variables.
+For Dokploy, use the root `.env.example` in the Compose service's Environment tab;
+Compose forwards these values to the Docker build. For local builds, use the template
+in `apps/frontend/.env.example`. Real `.env*` files stay out of Git and Docker's build context.
 
-## Production Deployment
+## Production Deployment with Dokploy
 
-`npm start` builds the workspace and starts one Node.js server. In hosted environments with a separate build step, use
-`npm run serve` as the start command so restarts do not rebuild the project. The production server serves the built React
-app from `apps/frontend/dist` and exposes `/api/*` and `/ws` from the same origin.
+Production runs through Dokploy using the root `docker-compose.yml` and multi-stage
+`Dockerfile`. One Node.js 24 container serves the built React app, `/api/*`, and `/ws`
+from the same origin. SQLite is stored on the persistent `pixelfleet-data` volume.
+The image runs as a non-root user and includes a healthcheck and graceful shutdown.
 
-For public deployments:
+Create a Dokploy **Docker Compose** service from this repository, set the Compose
+path to `./docker-compose.yml`, and configure its Environment using `.env.example`.
+Add your HTTPS domain for service `pixelfleet` on container port `3001`, path `/`.
+Run exactly one instance; active matches are kept in memory and end on redeployment.
 
-- Use Node.js 24 or newer.
-- Store the SQLite database on persistent storage by setting `DATABASE_PATH`.
-- Set `ADMIN_TOKEN` before exposing admin endpoints.
-- Set the `VITE_LEGAL_*` variables during the frontend build so the hosted legal pages contain the correct public
-  operator and privacy details.
-- Keep private `.env*` files out of Git. The repository intentionally tracks only `.env.example` files.
+See [the Dokploy deployment guide](docs/dokploy.md) for the complete setup, DNS,
+configuration, backup/restore, and verification steps.
 
 The production build emits static `/legal-notice/` and `/privacy-policy/` HTML shells with `noindex` robots metadata.
 The Node production server also sends `X-Robots-Tag: noindex, nofollow, noarchive` for `/legal-notice` and
