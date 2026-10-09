@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { frontendPageFromPath } from "@pixelfleet/shared";
 import type { ClientMessage, PlayerProfile, PublicCell, PublicMatchView, ServerMessage, ShipPlacement } from "@pixelfleet/shared";
 import { fetchMe, logoutGuest } from "./lib/api";
 import { GameScreen } from "./components/GameScreen";
@@ -7,24 +8,23 @@ import { LoginScreen } from "./components/LoginScreen";
 import { Matchmaking } from "./components/Matchmaking";
 import { ResultScreen } from "./components/ResultScreen";
 import { EightBitSkeleton, EightBitToastViewport } from "./components/8bit";
-import { LegalFooter, LegalPage, type LegalPageKind } from "./components/legal/LegalPages";
+import { LegalFooter, LegalPage } from "./components/legal/LegalPages";
+import { NotFoundPage } from "./components/NotFoundPage";
 
 type Toast = { id: string; tone: "default" | "success" | "warning" | "danger" | "info"; message: string };
 
-function legalPageFromPath(pathname: string): LegalPageKind | null {
-  if (pathname === "/legal-notice") {
-    return "legal-notice";
+export default function App() {
+  const page = frontendPageFromPath(window.location.pathname);
+  if (page === "not-found") {
+    return <NotFoundPage />;
   }
-
-  if (pathname === "/privacy-policy") {
-    return "privacy-policy";
+  if (page !== "game") {
+    return <LegalPage page={page} />;
   }
-
-  return null;
+  return <GameApp />;
 }
 
-export default function App() {
-  const legalPage = legalPageFromPath(window.location.pathname);
+function GameApp() {
   const [profile, setProfile] = useState<PlayerProfile | null>(null);
   const [loading, setLoading] = useState(true);
   const [socketConnected, setSocketConnected] = useState(false);
@@ -43,14 +43,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (legalPage) {
-      return;
-    }
-
     fetchMe()
       .then(setProfile)
       .finally(() => setLoading(false));
-  }, [legalPage]);
+  }, []);
 
   useEffect(() => {
     if (!profile) {
@@ -143,10 +139,6 @@ export default function App() {
     setProfile(null);
     setMatchView(null);
     setQueued(false);
-  }
-
-  if (legalPage) {
-    return <LegalPage page={legalPage} />;
   }
 
   if (loading) {

@@ -13,9 +13,9 @@ const noIndexTags = [
   '<meta name="googlebot" content="noindex, nofollow, noarchive" />'
 ];
 
-function legalRouteHtmlPlugin(): Plugin {
+function routeHtmlPlugin(): Plugin {
   return {
-    name: "pixelfleet-legal-route-html",
+    name: "pixelfleet-route-html",
     apply: "build",
     async closeBundle() {
       const indexPath = join(distDir, "index.html");
@@ -29,12 +29,14 @@ function legalRouteHtmlPlugin(): Plugin {
           await writeFile(join(routeDir, "index.html"), legalHtml);
         })
       );
+      const notFoundHtml = legalHtml.replace(/<title>.*?<\/title>/, "<title>404 - Page not found | Pixel Fleet</title>");
+      await writeFile(join(distDir, "404.html"), notFoundHtml);
     }
   };
 }
 
 export default defineConfig({
-  plugins: [react(), legalRouteHtmlPlugin()],
+  plugins: [react(), routeHtmlPlugin()],
   server: {
     port: 5173,
     proxy: {

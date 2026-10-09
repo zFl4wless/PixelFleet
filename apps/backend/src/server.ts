@@ -3,6 +3,7 @@ import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import { extname, join, normalize, sep } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
+import { frontendPageFromPath } from "@pixelfleet/shared";
 import {
   closeDatabase,
   createGuestAccount,
@@ -209,7 +210,7 @@ async function serveStatic(reqUrl: string | undefined, res: import("node:http").
   const url = new URL(reqUrl ?? "/", "http://localhost");
   const requestedPath = decodeURIComponent(url.pathname);
 
-  if (requestedPath.startsWith("/api") || requestedPath.startsWith("/ws")) {
+  if (requestedPath === "/api" || requestedPath.startsWith("/api/") || requestedPath === "/ws" || requestedPath.startsWith("/ws/")) {
     return false;
   }
 
@@ -223,19 +224,26 @@ async function serveStatic(reqUrl: string | undefined, res: import("node:http").
     return true;
   }
 
-  const filePath = await stat(safeCandidate)
-    .then((fileStat) => {
-      if (fileStat.isFile()) {
-        return safeCandidate;
-      }
+  const page = frontendPageFromPath(url.pathname);
+  let status = 200;
+  let filePath: string;
 
-      if (fileStat.isDirectory()) {
-        return join(safeCandidate, "index.html");
-      }
-
-      return join(frontendDistDir, "index.html");
-    })
-    .catch(() => join(frontendDistDir, "index.html"));
+  if (page === "game") {
+    filePath = join(frontendDistDir, "index.html");
+  } else if (page !== "not-found") {
+    filePath = join(frontendDistDir, page, "index.html");
+  } else {
+    const fileStat = await stat(safeCandidate).catch(() => null);
+    if (fileStat?.isFile() && extname(safeCandidate) !== ".html" && mimeTypes[extname(safeCandidate)]) {
+      filePath = safeCandidate;
+    } else if (requestedPath.startsWith("/assets/") || (extname(requestedPath) && extname(requestedPath) !== ".html")) {
+      // Missing resources must not receive an HTML app shell.
+      return false;
+    } else {
+      status = 404;
+      filePath = join(frontendDistDir, "404.html");
+    }
+  }
 
   try {
     await stat(filePath);
@@ -243,10 +251,11 @@ async function serveStatic(reqUrl: string | undefined, res: import("node:http").
     return false;
   }
 
-  res.writeHead(200, {
+  res.writeHead(status, {
     "Content-Type": mimeTypes[extname(filePath)] ?? "application/octet-stream",
-    "Cache-Control": filePath.endsWith("index.html") ? "no-cache" : "public, max-age=31536000, immutable",
-    ...(isNoIndexPath(requestedPath) ? { "X-Robots-Tag": "noindex, nofollow, noarchive" } : {})
+    "Cache-Control": extname(filePath) === ".html" ? "no-cache" : "public, max-age=31536000, immutable",
+    ...(status === 404 || isNoIndexPath(requestedPath) || page === "legal-notice" || page === "privacy-policy"
+      ? { "X-Robots-Tag": "noindex, nofollow, noarchive" } : {})
   });
   createReadStream(filePath).pipe(res);
   return true;

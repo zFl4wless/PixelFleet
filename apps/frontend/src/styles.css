@@ -106,6 +106,43 @@ h2 {
   image-rendering: pixelated;
 }
 
+.not-found-panel {
+  width: min(100%, 540px);
+  display: grid;
+  justify-items: center;
+  gap: 18px;
+  padding: 28px;
+  text-align: center;
+}
+
+.not-found-code {
+  color: var(--aqua-500);
+  font-size: clamp(4rem, 18vw, 7rem);
+  line-height: 1;
+  text-shadow: 5px 5px 0 var(--shadow);
+}
+
+.not-found-panel h1 {
+  font-size: clamp(1.4rem, 5vw, 2rem);
+}
+
+.not-found-description {
+  color: var(--gray-100);
+  line-height: 1.6;
+}
+
+.not-found-home {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+}
+
+.not-found-home:focus-visible {
+  outline: 3px solid var(--yellow);
+  outline-offset: 6px;
+}
+
 .field-label {
   color: var(--gray-100);
   font-size: 0.78rem;

@@ -14,6 +14,13 @@ beforeEach(async () => {
   directory = await mkdtemp(join(tmpdir(), "pixelfleet-deployment-"));
   await mkdir(join(directory, "frontend"));
   await writeFile(join(directory, "frontend/index.html"), "<!doctype html><title>Deployment fixture</title>");
+  await writeFile(join(directory, "frontend/404.html"), "<!doctype html><title>404 - Page not found | Pixel Fleet</title>");
+  for (const route of ["legal-notice", "privacy-policy"]) {
+    await mkdir(join(directory, "frontend", route));
+    await writeFile(join(directory, "frontend", route, "index.html"), `<!doctype html><title>${route}</title>`);
+  }
+  await mkdir(join(directory, "frontend/assets"));
+  await writeFile(join(directory, "frontend/assets/app.js"), "console.log('asset');");
 });
 
 afterEach(async () => {
@@ -71,6 +78,48 @@ async function stop(child: ChildProcess) {
 }
 
 describe("production deployment", () => {
+  it("serves a real 404 HTML page for unknown routes on GET and HEAD", async () => {
+    const { child, ready } = launch();
+    const url = await ready;
+    for (const path of ["/xxx", "/xxx/", "/legal-notice/unknown", "/apiculture", "/404.html"]) {
+      const response = await fetch(url + path);
+      expect(response.status).toBe(404);
+      expect(response.headers.get("content-type")).toContain("text/html");
+      expect(response.headers.get("cache-control")).toBe("no-cache");
+      expect(response.headers.get("x-robots-tag")).toContain("noindex");
+      expect(await response.text()).toContain("404 - Page not found");
+    }
+    const head = await fetch(`${url}/xxx`, { method: "HEAD" });
+    expect(head.status).toBe(404);
+    expect(await head.text()).toBe("");
+    await stop(child);
+  }, 15_000);
+
+  it("keeps known pages and assets available while missing assets and APIs return 404", async () => {
+    const { child, ready } = launch();
+    const url = await ready;
+    for (const path of ["/", "/index.html", "/legal-notice", "/legal-notice/", "/legal-notice/index.html", "/privacy-policy", "/privacy-policy/", "/%6Cegal-notice/"]) {
+      const response = await fetch(url + path);
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toContain("text/html");
+      if (path.includes("legal") || path.includes("privacy") || path.includes("%6C")) {
+        expect(response.headers.get("x-robots-tag")).toContain("noindex");
+      }
+      await response.text();
+    }
+    const asset = await fetch(`${url}/assets/app.js`);
+    expect(asset.status).toBe(200);
+    expect(asset.headers.get("content-type")).toContain("javascript");
+    expect(await asset.text()).toContain("console.log");
+    for (const path of ["/assets/missing.js", "/missing.svg", "/api/unknown", "/ws/unknown"]) {
+      const response = await fetch(url + path);
+      expect(response.status).toBe(404);
+      expect(response.headers.get("content-type")).toContain("application/json");
+      expect((await response.json()).error).toBe("Route not found.");
+    }
+    await stop(child);
+  }, 15_000);
+
   it("keeps health probes available after the visitor rate limit is exhausted", async () => {
     const { child, ready } = launch({ HTTP_REQUESTS_PER_MINUTE: "1" });
     const url = await ready;
