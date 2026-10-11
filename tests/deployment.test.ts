@@ -3,6 +3,8 @@ import { once } from "node:events";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 
@@ -37,8 +39,8 @@ afterEach(async () => {
   await rm(directory, { recursive: true, force: true });
 });
 
-function launch(overrides: Record<string, string> = {}) {
-  const child = spawn(process.execPath, ["--import", "tsx", "apps/backend/src/server.ts"], {
+function launch(overrides: Record<string, string> = {}, entrypoint = "apps/backend/src/server.ts") {
+  const child = spawn(process.execPath, ["--import", "tsx", entrypoint], {
     env: {
       ...process.env,
       NODE_ENV: "production",
@@ -77,7 +79,216 @@ async function stop(child: ChildProcess) {
   expect(code).toBe(0);
 }
 
+async function loginGuest(url: string, username = "Cookie test guest") {
+  const response = await fetch(`${url}/api/guest-login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: url },
+    body: JSON.stringify({ username })
+  });
+  expect(response.status).toBe(201);
+  const cookie = response.headers.get("set-cookie")!.split(";")[0];
+  const { profile } = await response.json();
+  return { cookie, profile };
+}
+
+async function openSessionSocket(url: string, cookie: string) {
+  const socket = new WebSocket(`${url.replace("http:", "ws:")}/ws`, {
+    headers: { Cookie: cookie, Origin: url },
+    handshakeTimeout: 2_000
+  });
+  sockets.push(socket);
+  const firstMessage = once(socket, "message");
+  // Observe both promises immediately if the handshake unexpectedly fails.
+  const [, [data]] = await Promise.all([once(socket, "open"), firstMessage]);
+  const message = JSON.parse(data.toString());
+  expect(message.type).toBe("profile");
+  return { socket, profile: message.profile };
+}
+
+async function rejectedUpgrade(url: string, cookie?: string, origin = url): Promise<number> {
+  const socket = new WebSocket(`${url.replace("http:", "ws:")}/ws`, {
+    headers: { Origin: origin, ...(cookie === undefined ? {} : { Cookie: cookie }) },
+    handshakeTimeout: 2_000
+  });
+  sockets.push(socket);
+  let connectionHeader: string | undefined;
+  let setCookieHeader: string[] | undefined;
+  let contentLengthHeader: string | undefined;
+  const statusCode = await new Promise<number>((resolve, reject) => {
+    let status: number | undefined;
+    socket.on("error", (error) => {
+      if (status === undefined) {
+        reject(error);
+      }
+    });
+    socket.once("open", () => {
+      reject(new Error("Rejected authentication unexpectedly opened a WebSocket."));
+      socket.terminate();
+    });
+    socket.once("unexpected-response", (_request, response) => {
+      status = response.statusCode;
+      connectionHeader = response.headers.connection;
+      setCookieHeader = response.headers["set-cookie"];
+      contentLengthHeader = response.headers["content-length"];
+      response.resume();
+      socket.terminate();
+    });
+    socket.once("close", () => {
+      if (status === undefined) {
+        reject(new Error("Upgrade closed without a controlled HTTP rejection."));
+      } else {
+        resolve(status);
+      }
+    });
+  });
+  expect(connectionHeader).toBe("close");
+  expect(setCookieHeader).toBeUndefined();
+  expect(contentLengthHeader).toBe("0");
+  return statusCode;
+}
+
 describe("production deployment", () => {
+  it("rejects malformed cookies without creating accounts or changing an existing HTTP session", async () => {
+    const { child, ready } = launch();
+    const url = await ready;
+    const { cookie, profile } = await loginGuest(url);
+    for (const invalid of ["pf_session=%", "pf_session=%GG", "pf_session=%C3", `${cookie}; preference=%`]) {
+      for (const [path, method] of [["/api/me", "GET"], ["/api/guest-login", "POST"], ["/api/logout", "POST"]]) {
+        const response = await fetch(url + path, {
+          method,
+          headers: { Cookie: invalid, Origin: url, "Content-Type": "application/json" },
+          ...(method === "POST" ? { body: JSON.stringify({ username: "Unused dummy guest" }) } : {})
+        });
+        expect(response.status).toBe(400);
+        expect(response.headers.get("set-cookie")).toBeNull();
+        expect((await response.json()).error).toBe("Invalid cookie encoding.");
+      }
+    }
+    const me = await fetch(`${url}/api/me`, { headers: { Cookie: `theme=dark; ${cookie}` } });
+    expect(me.status).toBe(200);
+    expect((await me.json()).profile.userId).toBe(profile.userId);
+    const existingLogin = await fetch(`${url}/api/guest-login`, {
+      method: "POST", headers: { Cookie: cookie, Origin: url }
+    });
+    expect(existingLogin.status).toBe(200);
+    expect((await existingLogin.json()).profile.userId).toBe(profile.userId);
+    const status = await fetch(`${url}/api/admin/status`, {
+      headers: { Authorization: "Bearer deployment-test-token" }
+    });
+    expect(status.status).toBe(200);
+    expect((await status.json()).database).toMatchObject({ users: 1, sessions: 1 });
+    await stop(child);
+  }, 15_000);
+
+  it("controls upgrade rejection and preserves valid authentication and active connection limits", async () => {
+    const { child, ready } = launch({ MAX_WS_PER_IP: "1" });
+    const url = await ready;
+    const { cookie, profile } = await loginGuest(url);
+    for (const invalid of ["pf_session=%", "pf_session=%GG", "pf_session=%C3", `${cookie}; preference=%`]) {
+      expect(await rejectedUpgrade(url, invalid)).toBe(400);
+    }
+    expect(await rejectedUpgrade(url)).toBe(401);
+    expect(await rejectedUpgrade(url, "pf_session=unknown-dummy-token")).toBe(401);
+    expect(await rejectedUpgrade(url, cookie, "https://untrusted.example")).toBe(403);
+    const health = await fetch(`${url}/api/health`);
+    expect(health.status).toBe(200);
+    expect((await health.json()).hub).toMatchObject({ activeConnections: 0, queuedPlayers: 0, matches: 0 });
+    const token = cookie.slice("pf_session=".length);
+    const encodedCookie = `pf_session=%${token.charCodeAt(0).toString(16)}${token.slice(1)}`;
+    const opened = await openSessionSocket(url, `theme=dark; ${encodedCookie}`);
+    expect(opened.profile.userId).toBe(profile.userId);
+    expect(await rejectedUpgrade(url, cookie)).toBe(429);
+    const closed = once(opened.socket, "close");
+    opened.socket.close();
+    await closed;
+    await expect.poll(async () => (await (await fetch(`${url}/api/health`)).json()).hub.activeConnections).toBe(0);
+    const reconnected = await openSessionSocket(url, cookie);
+    expect(reconnected.profile.userId).toBe(profile.userId);
+    await stop(child);
+  }, 15_000);
+
+  it("returns a controlled upgrade error on session storage failure and recovers without a leaked slot", async () => {
+    const { child, ready } = launch({ MAX_WS_PER_IP: "1" });
+    const url = await ready;
+    const { cookie, profile } = await loginGuest(url);
+    const fixtureDatabase = new DatabaseSync(join(directory, "pixelfleet.sqlite"));
+    try {
+      fixtureDatabase.exec("ALTER TABLE sessions RENAME TO sessions_fixture_backup");
+      try {
+        expect(await rejectedUpgrade(url, cookie)).toBe(500);
+        const health = await fetch(`${url}/api/health`);
+        expect(health.status).toBe(200);
+        expect((await health.json()).hub.activeConnections).toBe(0);
+      } finally {
+        fixtureDatabase.exec("ALTER TABLE sessions_fixture_backup RENAME TO sessions");
+      }
+    } finally {
+      fixtureDatabase.close();
+    }
+    const me = await fetch(`${url}/api/me`, { headers: { Cookie: cookie } });
+    expect(me.status).toBe(200);
+    expect((await me.json()).profile.userId).toBe(profile.userId);
+    expect((await openSessionSocket(url, cookie)).profile.userId).toBe(profile.userId);
+    await stop(child);
+  }, 15_000);
+
+  it("cleans up failed initialization after the handshake without releasing another connection's slot", async () => {
+    // Fault injection is confined to this disposable test entrypoint, with no application test hook.
+    const entrypoint = join(directory, "initialization-fault.mjs");
+    const hubUrl = pathToFileURL(join(process.cwd(), "apps/backend/src/game-hub.ts")).href;
+    const serverUrl = pathToFileURL(join(process.cwd(), "apps/backend/src/server.ts")).href;
+    await writeFile(entrypoint, `
+      const { GameHub } = await import(${JSON.stringify(hubUrl)});
+      const originalConnect = GameHub.prototype.connect;
+      let connections = 0;
+      GameHub.prototype.connect = function (ws, ...args) {
+        connections += 1;
+        if (connections !== 2) return originalConnect.call(this, ws, ...args);
+        const originalSend = ws.send;
+        ws.send = () => { throw new Error("Dummy initialization failure"); };
+        try { return originalConnect.call(this, ws, ...args); }
+        finally { ws.send = originalSend; }
+      };
+      await import(${JSON.stringify(serverUrl)});
+    `);
+    const { child, ready } = launch({ MAX_WS_PER_IP: "2" }, entrypoint);
+    const url = await ready;
+    const first = await loginGuest(url, "First dummy guest");
+    const second = await loginGuest(url, "Second dummy guest");
+    const stable = await openSessionSocket(url, first.cookie);
+    const failed = new WebSocket(`${url.replace("http:", "ws:")}/ws`, {
+      headers: { Cookie: second.cookie, Origin: url }, handshakeTimeout: 2_000
+    });
+    sockets.push(failed);
+    const messages: string[] = [];
+    failed.on("message", (data) => messages.push(data.toString()));
+    // Termination can arrive before the client observes the already-written handshake.
+    failed.on("error", () => {});
+    const closed = new Promise<[number]>((resolve) => failed.once("close", (code) => resolve([code])));
+    expect((await closed)[0]).toBe(1006);
+    expect(messages).toEqual([]);
+    await expect.poll(async () => (await (await fetch(`${url}/api/health`)).json()).hub.activeConnections).toBe(1);
+    expect(stable.socket.readyState).toBe(WebSocket.OPEN);
+    const recovered = await openSessionSocket(url, second.cookie);
+    expect(recovered.profile.userId).toBe(second.profile.userId);
+    expect(await rejectedUpgrade(url, first.cookie)).toBe(429);
+    await stop(child);
+  }, 15_000);
+
+  it("keeps failed upgrade attempts charged to the attempt limit", async () => {
+    const { child, ready } = launch({ MAX_WS_PER_IP: "1", WS_CONNECTS_PER_MINUTE: "2" });
+    const url = await ready;
+    const { cookie } = await loginGuest(url);
+    expect(await rejectedUpgrade(url, "pf_session=%")).toBe(400);
+    const { socket } = await openSessionSocket(url, cookie);
+    const closed = once(socket, "close");
+    socket.close();
+    await closed;
+    await expect.poll(async () => (await (await fetch(`${url}/api/health`)).json()).hub.activeConnections).toBe(0);
+    expect(await rejectedUpgrade(url, cookie)).toBe(429);
+    await stop(child);
+  }, 15_000);
+
   it("serves a real 404 HTML page for unknown routes on GET and HEAD", async () => {
     const { child, ready } = launch();
     const url = await ready;

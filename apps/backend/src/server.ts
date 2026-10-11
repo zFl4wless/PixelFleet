@@ -17,6 +17,7 @@ import {
   clearSessionCookie,
   getClientIp,
   getSessionToken,
+  InvalidCookieError,
   isTrustedOrigin,
   isSecureRequest,
   readJson,
@@ -366,59 +367,95 @@ const heartbeatInterval = setInterval(() => {
 
 server.on("close", () => clearInterval(heartbeatInterval));
 
+function rejectUpgrade(
+  socket: import("node:stream").Duplex,
+  status: "400 Bad Request" | "401 Unauthorized" | "403 Forbidden" | "429 Too Many Requests" | "500 Internal Server Error",
+  retryAfter?: number
+): void {
+  if (socket.destroyed) {
+    return;
+  }
+  if (socket.writableEnded) {
+    socket.destroy();
+    return;
+  }
+  const retryHeader = retryAfter === undefined ? "" : `Retry-After: ${retryAfter}\r\n`;
+  socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n${retryHeader}\r\n`, () => socket.destroy());
+}
+
 server.on("upgrade", (req, socket, head) => {
-  if (shuttingDown || !req.url?.startsWith("/ws")) {
-    socket.destroy();
-    return;
-  }
+  socket.once("error", () => socket.destroy());
+  const upgrade: { socket?: HeartbeatSocket; releaseConnection?: () => void } = {};
 
-  const ip = getClientIp(req);
-  const connectLimit = wsConnectLimiter.check(`ws:${ip}`);
-  const activeForIp = activeWsByIp.get(ip) ?? 0;
+  try {
+    if (shuttingDown || !req.url?.startsWith("/ws")) {
+      socket.destroy();
+      return;
+    }
 
-  if (!isTrustedOrigin(req)) {
-    metrics.inc("ws_connections_rejected_total");
-    metrics.event("security", `Blocked WebSocket from untrusted origin ${req.headers.origin ?? "none"} (${ip})`);
-    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
-    socket.destroy();
-    return;
-  }
+    const ip = getClientIp(req);
+    const connectLimit = wsConnectLimiter.check(`ws:${ip}`);
+    const activeForIp = activeWsByIp.get(ip) ?? 0;
 
-  if (!connectLimit.allowed || activeForIp >= maxWsPerIp) {
-    metrics.inc("ws_connections_rejected_total");
-    metrics.inc("rate_limited_total");
-    socket.write("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\n\r\n");
-    socket.destroy();
-    return;
-  }
+    if (!isTrustedOrigin(req)) {
+      metrics.inc("ws_connections_rejected_total");
+      metrics.event("security", `Blocked WebSocket from untrusted origin ${req.headers.origin ?? "none"} (${ip})`);
+      rejectUpgrade(socket, "403 Forbidden");
+      return;
+    }
 
-  const profile = getProfileBySessionToken(getSessionToken(req));
-  if (!profile) {
-    metrics.inc("ws_connections_rejected_total");
-    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-    socket.destroy();
-    return;
-  }
+    if (!connectLimit.allowed || activeForIp >= maxWsPerIp) {
+      metrics.inc("ws_connections_rejected_total");
+      metrics.inc("rate_limited_total");
+      rejectUpgrade(socket, "429 Too Many Requests", 60);
+      return;
+    }
 
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    const heartbeatSocket = ws as HeartbeatSocket;
-    heartbeatSocket.isAlive = true;
-    heartbeatSocket.on("pong", () => {
+    const profile = getProfileBySessionToken(getSessionToken(req));
+    if (!profile) {
+      metrics.inc("ws_connections_rejected_total");
+      rejectUpgrade(socket, "401 Unauthorized");
+      return;
+    }
+
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      const heartbeatSocket = ws as HeartbeatSocket;
+      upgrade.socket = heartbeatSocket;
       heartbeatSocket.isAlive = true;
-    });
+      heartbeatSocket.on("pong", () => {
+        heartbeatSocket.isAlive = true;
+      });
 
-    activeWsByIp.set(ip, activeForIp + 1);
-    heartbeatSocket.on("close", () => {
-      const nextCount = Math.max(0, (activeWsByIp.get(ip) ?? 1) - 1);
-      if (nextCount === 0) {
-        activeWsByIp.delete(ip);
-      } else {
-        activeWsByIp.set(ip, nextCount);
-      }
-    });
+      activeWsByIp.set(ip, (activeWsByIp.get(ip) ?? 0) + 1);
+      let released = false;
+      const releaseConnection = () => {
+        if (released) {
+          return;
+        }
+        released = true;
+        const nextCount = Math.max(0, (activeWsByIp.get(ip) ?? 1) - 1);
+        if (nextCount === 0) {
+          activeWsByIp.delete(ip);
+        } else {
+          activeWsByIp.set(ip, nextCount);
+        }
+      };
+      upgrade.releaseConnection = releaseConnection;
+      heartbeatSocket.once("close", releaseConnection);
 
-    hub.connect(ws, profile, { ip });
-  });
+      hub.connect(ws, profile, { ip });
+    });
+  } catch (error) {
+    // Failed attempts remain rate-limited; only an acquired active slot is released.
+    upgrade.releaseConnection?.();
+    if (upgrade.socket) {
+      upgrade.socket.terminate();
+    } else {
+      rejectUpgrade(socket, error instanceof InvalidCookieError ? "400 Bad Request" : "500 Internal Server Error");
+    }
+    metrics.inc("ws_connections_rejected_total");
+    metrics.event("error", error instanceof InvalidCookieError ? "Invalid WebSocket cookie encoding" : "WebSocket upgrade failed");
+  }
 });
 
 function shutdown(signal: string): void {

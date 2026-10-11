@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { isAllowedOrigin } from "../apps/backend/src/http";
+import type { IncomingMessage } from "node:http";
+import { getSessionToken, InvalidCookieError, isAllowedOrigin } from "../apps/backend/src/http";
 
 const originalFrontendOrigin = process.env.FRONTEND_ORIGIN;
 const originalNodeEnv = process.env.NODE_ENV;
@@ -16,6 +17,29 @@ afterEach(() => {
   } else {
     process.env.NODE_ENV = originalNodeEnv;
   }
+});
+
+describe("session cookies", () => {
+  function sessionToken(cookie?: string) {
+    return getSessionToken({ headers: { cookie } } as IncomingMessage);
+  }
+
+  it("keeps missing sessions distinct from valid decoded session cookies", () => {
+    expect(sessionToken()).toBeNull();
+    expect(sessionToken("theme=dark")).toBeNull();
+    expect(sessionToken("pf_session=dummy-token")).toBe("dummy-token");
+    expect(sessionToken("theme=dark; pf_session=dummy%2Dtoken; preference=a%3Db")).toBe("dummy-token");
+    expect(sessionToken("  pf_session=dummy=token  ; theme=dark")).toBe("dummy=token");
+  });
+
+  it.each(["%", "%GG", "%C3"])("rejects invalid encoding %s instead of returning a session", (value) => {
+    expect(() => sessionToken(`pf_session=${value}`)).toThrow(InvalidCookieError);
+  });
+
+  it("rejects a malformed header even when another cookie contains a valid session", () => {
+    expect(() => sessionToken("pf_session=dummy-token; preference=%")).toThrow(InvalidCookieError);
+    expect(() => sessionToken("preference=%; pf_session=dummy-token")).toThrow(InvalidCookieError);
+  });
 });
 
 describe("origin checks", () => {

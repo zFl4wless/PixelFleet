@@ -5,6 +5,13 @@ const ONE_YEAR_SECONDS = 60 * 60 * 24 * 365;
 const DEFAULT_MAX_JSON_BYTES = 16 * 1024;
 const VITE_DEV_PORTS = new Set(["5173", "5174", "5175", "5176", "5177", "5178", "5179"]);
 
+export class InvalidCookieError extends Error {
+  constructor() {
+    super("Invalid cookie encoding.");
+    this.name = "InvalidCookieError";
+  }
+}
+
 export function parseCookies(header: string | undefined): Record<string, string> {
   if (!header) {
     return {};
@@ -20,7 +27,12 @@ export function parseCookies(header: string | undefined): Record<string, string>
         if (separator === -1) {
           return [part, ""];
         }
-        return [part.slice(0, separator), decodeURIComponent(part.slice(separator + 1))];
+        try {
+          return [part.slice(0, separator), decodeURIComponent(part.slice(separator + 1))];
+        } catch {
+          // Reject the entire header rather than authenticating from partial results.
+          throw new InvalidCookieError();
+        }
       })
   );
 }

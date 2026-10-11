@@ -96,6 +96,8 @@ export class GameHub {
     }
 
     this.connections.set(profile.userId, { userId: profile.userId, ws, profile, ip: context.ip });
+    // Also clean up if connection initialization fails before message handlers are installed.
+    ws.on("close", () => this.disconnect(profile.userId, ws));
     metrics.inc("ws_connections_accepted_total");
     this.send(profile.userId, { type: "profile", profile });
 
@@ -115,7 +117,6 @@ export class GameHub {
     }
 
     ws.on("message", (payload) => this.handleMessage(profile.userId, payload.toString()));
-    ws.on("close", () => this.disconnect(profile.userId, ws));
   }
 
   private disconnect(userId: string, ws: WebSocket): void {
