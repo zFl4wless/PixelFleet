@@ -93,9 +93,9 @@ async function loginGuest(url: string, username = "Cookie test guest") {
   return { cookie, profile };
 }
 
-async function openSessionSocket(url: string, cookie: string, origin = url) {
+async function openSessionSocket(url: string, cookie: string, origin = url, headers: Record<string, string> = {}) {
   const socket = new WebSocket(`${url.replace("http:", "ws:")}/ws`, {
-    headers: { Cookie: cookie, Origin: origin },
+    headers: { ...headers, Cookie: cookie, Origin: origin },
     handshakeTimeout: 2_000
   });
   sockets.push(socket);
@@ -107,9 +107,9 @@ async function openSessionSocket(url: string, cookie: string, origin = url) {
   return { socket, profile: message.profile };
 }
 
-async function rejectedUpgrade(url: string, cookie?: string, origin = url): Promise<number> {
+async function rejectedUpgrade(url: string, cookie?: string, origin = url, headers: Record<string, string> = {}): Promise<number> {
   const socket = new WebSocket(`${url.replace("http:", "ws:")}/ws`, {
-    headers: { Origin: origin, ...(cookie === undefined ? {} : { Cookie: cookie }) },
+    headers: { ...headers, Origin: origin, ...(cookie === undefined ? {} : { Cookie: cookie }) },
     handshakeTimeout: 2_000
   });
   sockets.push(socket);
@@ -150,6 +150,68 @@ async function rejectedUpgrade(url: string, cookie?: string, origin = url): Prom
 }
 
 describe("production deployment", () => {
+  it.each(["false", "true"])("keeps login and logout cookie attributes consistent with TRUST_PROXY=%s", async (trust) => {
+    const { child, ready } = launch({ TRUST_PROXY: trust });
+    const url = await ready;
+    for (const proto of [undefined, "http", "https"]) {
+      const headers = { Origin: url, ...(proto ? { "X-Forwarded-Proto": proto } : {}) };
+      const login = await fetch(`${url}/api/guest-login`, {
+        method: "POST", headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "Transport policy dummy" })
+      });
+      expect(login.status).toBe(201);
+      const issued = login.headers.get("set-cookie")!.split("; ");
+      await login.json();
+      const logout = await fetch(`${url}/api/logout`, {
+        method: "POST", headers: { ...headers, Cookie: issued[0] }
+      });
+      expect(logout.status).toBe(200);
+      expect(await logout.json()).toEqual({ ok: true });
+      const cleared = logout.headers.get("set-cookie")!.split("; ");
+      const attributes = ["Path=/", "HttpOnly", "SameSite=Lax", ...(trust === "true" && proto === "https" ? ["Secure"] : [])];
+      expect(issued[0]).toMatch(/^pf_session=.+/);
+      expect(cleared[0]).toBe("pf_session=");
+      expect(issued).toContain("Max-Age=31536000");
+      expect(cleared).toContain("Max-Age=0");
+      expect(issued.slice(1).filter((part) => !part.startsWith("Max-Age="))).toEqual(attributes);
+      expect(cleared.slice(1).filter((part) => !part.startsWith("Max-Age="))).toEqual(attributes);
+    }
+    await stop(child);
+  }, 15_000);
+
+  it.each(["false", "true"])("uses the selected client IP for HTTP quotas with TRUST_PROXY=%s", async (trust) => {
+    const { child, ready } = launch({ TRUST_PROXY: trust, HTTP_REQUESTS_PER_MINUTE: "1" });
+    const url = await ready;
+    for (const [index, ip] of ["203.0.113.7", "203.0.113.8"].entries()) {
+      const login = await fetch(`${url}/api/guest-login`, {
+        method: "POST",
+        headers: { Origin: url, "X-Forwarded-For": ip, "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "HTTP quota dummy" })
+      });
+      expect(login.status).toBe(index === 0 || trust === "true" ? 201 : 429);
+      await login.json();
+    }
+    await stop(child);
+  }, 15_000);
+
+  it.each(["false", "true"])("uses the selected client IP for WebSocket caps with TRUST_PROXY=%s", async (trust) => {
+    const { child, ready } = launch({ TRUST_PROXY: trust, MAX_WS_PER_IP: "1" });
+    const url = await ready;
+    const first = await loginGuest(url, "First quota dummy");
+    const second = await loginGuest(url, "Second quota dummy");
+    const stable = await openSessionSocket(url, first.cookie, url, { "X-Forwarded-For": "203.0.113.7" });
+    if (trust === "true") {
+      const other = await openSessionSocket(url, second.cookie, url, { "X-Forwarded-For": "203.0.113.8" });
+      expect(other.profile.userId).toBe(second.profile.userId);
+    } else {
+      expect(await rejectedUpgrade(url, second.cookie, url, { "X-Forwarded-For": "203.0.113.8" })).toBe(429);
+    }
+    expect(stable.socket.readyState).toBe(WebSocket.OPEN);
+    const health = await fetch(`${url}/api/health`);
+    expect((await health.json()).hub.activeConnections).toBe(trust === "true" ? 2 : 1);
+    await stop(child);
+  }, 15_000);
+
   it.each(["development", "production"])("keeps HTTP, CORS and WebSocket origin decisions consistent in %s", async (mode) => {
     const { child, ready } = launch({ NODE_ENV: mode });
     const url = await ready;

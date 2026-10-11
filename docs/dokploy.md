@@ -1,9 +1,10 @@
 # Dokploy deployment
 
 Pixel Fleet is deployed as one Docker Compose service, `pixelfleet`. The container
-serves the built frontend, `/api/*`, and `/ws` on port **3001**. Dokploy's Traefik
-proxy terminates HTTPS and forwards traffic to that port. No separate frontend
-deployment, external database, or custom Traefik labels are needed.
+serves the built frontend, `/api/*`, and `/ws` on port **3001**. In the intended
+topology, Dokploy's Traefik proxy terminates HTTPS and forwards traffic to that
+port. No separate frontend deployment, external database, or custom Traefik labels
+are needed.
 
 ## Create the deployment
 
@@ -73,12 +74,43 @@ into a separate test deployment before relying on backups.
 - SIGTERM/SIGINT stops accepting connections, closes WebSockets with code 1012
   (server restart), clears match timers, and closes SQLite. Shutdown has a 10-second
   limit within Compose's 15-second stop grace period.
-- `TRUST_PROXY=true` trusts Dokploy's forwarded client IP/protocol headers for rate
-  limits and secure cookies. Port 3001 is internal and is not published on the host.
+- `TRUST_PROXY=true` uses the first `X-Forwarded-For` entry for client IP and an
+  exact `X-Forwarded-Proto: https` value for secure cookies. Direct socket TLS also
+  marks cookies secure. Cookie issuance and deletion use the same decision.
+- `TRUST_PROXY=false` ignores forwarding headers for both client IP and cookie
+  security, using only the socket's remote address and TLS state. Plain local HTTP
+  works without `Secure`; direct TLS retains `Secure` in both modes.
+- The Dockerfile defaults `TRUST_PROXY` to `true`; production Compose fixes it to
+  `true` for this proxy topology. Port 3001 has no host-port publication in the
+  checked-in Compose file. The local container override below sets trust to `false`.
 - Container logs rotate at 10 MB with three files retained. Adjust this and the
   server/proxy log configuration to match your stated retention policy.
 - Optional rate-limit overrides are listed in `.env.example`. `PORT`,
   `DATABASE_PATH`, and `NODE_ENV` are fixed by the production Compose configuration.
+
+## Proxy configuration evidence
+
+The repository does not contain the effective Dokploy/Traefik routing and network
+configuration. `TRUST_PROXY=true` does not validate the socket peer against a proxy
+allowlist or establish whether incoming forwarding headers were sanitized. Before
+relying on this production topology, obtain evidence for the actual deployment:
+
+- The effective HTTPS termination, HTTP-to-HTTPS redirect, public Host routing and
+  WebSocket route to container port 3001.
+- Which peers and forwarding hops can reach the backend, including other containers
+  on its attached networks. The absence of a published host port alone does not
+  establish that all reachable peers are trusted proxies.
+- How the effective proxy configuration handles client-supplied `X-Forwarded-For`
+  and `X-Forwarded-Proto`, including any upstream proxies. Establish that the first
+  forwarded client entry and the exact protocol value consumed by Node are authoritative.
+- Login and logout cookie attributes on the public HTTPS route and the client IP
+  actually used for HTTP and WebSocket quotas in an authorized test deployment.
+
+No proxy peer addresses, trusted network ranges or header-cleaning rules are supplied
+here because they must come from the actual deployment. The local SA-06 fix unifies
+the application's trust switch; it does not confirm production proxy security.
+See [the SA-06 fix status](security/SA-06-FIX-STATUS.md) for the repository evidence,
+test status and remaining deployment questions.
 
 ## Verify after deployment
 

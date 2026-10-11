@@ -71,7 +71,15 @@ Backend runtime configuration:
 | `FRONTEND_ORIGIN`   | Optional extra allowed origin for local tooling; not needed in Dokploy.          |
 | `FRONTEND_DIST_DIR` | Optional frontend directory override for local tooling.                           |
 | `ADMIN_TOKEN`       | Enables protected admin and metrics endpoints.                                    |
-| `TRUST_PROXY`       | Defaults to `true`; set to `false` when no trusted proxy sets forwarding headers. |
+| `TRUST_PROXY`       | Defaults to `true`; `false` uses socket client IP and TLS only, ignoring forwarding headers. |
+
+With proxy trust enabled, the backend uses the first `X-Forwarded-For` entry for
+client IP and an exact `X-Forwarded-Proto: https` value for secure session cookies.
+Direct TLS remains secure in either mode. Cookie issuance and deletion use the same
+transport decision. Set `TRUST_PROXY=false` for direct local HTTP development.
+Production Compose fixes it to `true` for the documented proxy topology; the local
+container override sets it to `false`. Verify the actual proxy configuration and
+backend access paths as described in [the deployment guide](docs/dokploy.md#proxy-configuration-evidence).
 
 Legal page details are configured at frontend build time with public `VITE_LEGAL_*` variables.
 For Dokploy, use the root `.env.example` in the Compose service's Environment tab;

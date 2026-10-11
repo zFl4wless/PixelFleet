@@ -54,16 +54,21 @@ export function clearSessionCookie(secure: boolean): string {
   return `${SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${secureFlag}`;
 }
 
+function trustsProxyHeaders(): boolean {
+  return process.env.TRUST_PROXY !== "false";
+}
+
 export function isSecureRequest(req: IncomingMessage): boolean {
-  return req.headers["x-forwarded-proto"] === "https" || Boolean((req.socket as { encrypted?: boolean }).encrypted);
+  return Boolean((req.socket as { encrypted?: boolean }).encrypted) ||
+    (trustsProxyHeaders() && req.headers["x-forwarded-proto"] === "https");
 }
 
 export function getClientIp(req: IncomingMessage): string {
-  const trustProxy = process.env.TRUST_PROXY !== "false";
-  const forwardedFor = req.headers["x-forwarded-for"];
-
-  if (trustProxy && typeof forwardedFor === "string" && forwardedFor.length > 0) {
-    return forwardedFor.split(",")[0]?.trim() || "unknown";
+  if (trustsProxyHeaders()) {
+    const forwardedFor = req.headers["x-forwarded-for"];
+    if (typeof forwardedFor === "string" && forwardedFor.length > 0) {
+      return forwardedFor.split(",")[0]?.trim() || "unknown";
+    }
   }
 
   return req.socket.remoteAddress ?? "unknown";

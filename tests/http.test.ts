@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { getSessionToken, InvalidCookieError, isAllowedOrigin, isTrustedOrigin, setCors } from "../apps/backend/src/http";
+import { clearSessionCookie, getClientIp, getSessionToken, InvalidCookieError, isAllowedOrigin, isSecureRequest, isTrustedOrigin, sessionCookie, setCors } from "../apps/backend/src/http";
 
 const originalFrontendOrigin = process.env.FRONTEND_ORIGIN;
 const originalNodeEnv = process.env.NODE_ENV;
+const originalTrustProxy = process.env.TRUST_PROXY;
 
 afterEach(() => {
   if (originalFrontendOrigin === undefined) {
@@ -17,6 +18,87 @@ afterEach(() => {
   } else {
     process.env.NODE_ENV = originalNodeEnv;
   }
+  if (originalTrustProxy === undefined) delete process.env.TRUST_PROXY;
+  else process.env.TRUST_PROXY = originalTrustProxy;
+});
+
+describe("proxy trust and cookie transport", () => {
+  function request(headers: IncomingMessage["headers"] = {}, encrypted = false, remoteAddress: string | undefined = "192.0.2.10") {
+    return { headers, socket: { encrypted, remoteAddress } } as unknown as IncomingMessage;
+  }
+
+  it("ignores forwarded client and transport information when proxy trust is disabled", () => {
+    process.env.TRUST_PROXY = "false";
+    for (const proto of ["https", "http", ["https"]]) {
+      const req = request({ "x-forwarded-for": "203.0.113.7, 192.0.2.20", "x-forwarded-proto": proto, forwarded: "for=203.0.113.7;proto=https" });
+      expect(getClientIp(req)).toBe("192.0.2.10");
+      expect(isSecureRequest(req)).toBe(false);
+    }
+    const noPeer = request({ "x-forwarded-for": "203.0.113.7", "x-forwarded-proto": "https" });
+    delete (noPeer.socket as { remoteAddress?: string }).remoteAddress;
+    expect(getClientIp(noPeer)).toBe("unknown");
+    expect(isSecureRequest(noPeer)).toBe(false);
+  });
+
+  it("keeps direct TLS secure regardless of proxy trust and a conflicting protocol header", () => {
+    for (const trust of ["false", "true"]) {
+      process.env.TRUST_PROXY = trust;
+      expect(isSecureRequest(request({ "x-forwarded-proto": "http" }, true))).toBe(true);
+      expect(isSecureRequest(request({}, true))).toBe(true);
+    }
+    process.env.TRUST_PROXY = "false";
+    expect(getClientIp(request({ "x-forwarded-for": "203.0.113.7" }, true))).toBe("192.0.2.10");
+  });
+
+  it("keeps the documented first forwarded client and HTTPS protocol when proxy trust is enabled", () => {
+    process.env.TRUST_PROXY = "true";
+    const req = request({ "x-forwarded-for": " 203.0.113.7, 192.0.2.20", "x-forwarded-proto": "https" });
+    expect(getClientIp(req)).toBe("203.0.113.7");
+    expect(isSecureRequest(req)).toBe(true);
+  });
+
+  it("preserves the documented enabled default when TRUST_PROXY is unset", () => {
+    delete process.env.TRUST_PROXY;
+    const req = request({ "x-forwarded-for": "203.0.113.7", "x-forwarded-proto": "https" });
+    expect(getClientIp(req)).toBe("203.0.113.7");
+    expect(isSecureRequest(req)).toBe(true);
+  });
+
+  it("uses socket fallbacks and permits plain local HTTP without usable proxy headers", () => {
+    for (const trust of ["false", "true"]) {
+      process.env.TRUST_PROXY = trust;
+      for (const headers of [{}, { "x-forwarded-for": "", "x-forwarded-proto": "http" }, { "x-forwarded-for": ["203.0.113.7"], "x-forwarded-proto": ["https"] }]) {
+        expect(getClientIp(request(headers))).toBe("192.0.2.10");
+        expect(isSecureRequest(request(headers))).toBe(false);
+      }
+    }
+  });
+
+  it("uses the same transport decision and cookie scope for session issue and deletion", () => {
+    const cases = [
+      { trust: "false", tls: false, proto: undefined, secure: false },
+      { trust: "false", tls: false, proto: "https", secure: false },
+      { trust: "false", tls: true, proto: "http", secure: true },
+      { trust: "true", tls: false, proto: undefined, secure: false },
+      { trust: "true", tls: false, proto: "http", secure: false },
+      { trust: "true", tls: false, proto: "https", secure: true },
+      { trust: "true", tls: true, proto: "http", secure: true }
+    ];
+    for (const fixture of cases) {
+      process.env.TRUST_PROXY = fixture.trust;
+      const secure = isSecureRequest(request({ "x-forwarded-proto": fixture.proto }, fixture.tls));
+      expect(secure).toBe(fixture.secure);
+      const issued = sessionCookie("dummy-session-token", secure).split("; ");
+      const cleared = clearSessionCookie(secure).split("; ");
+      expect(issued[0]).toBe("pf_session=dummy-session-token");
+      expect(cleared[0]).toBe("pf_session=");
+      expect(issued).toContain("Max-Age=31536000");
+      expect(cleared).toContain("Max-Age=0");
+      const attributes = ["Path=/", "HttpOnly", "SameSite=Lax", ...(fixture.secure ? ["Secure"] : [])];
+      expect(issued.slice(1).filter((part) => !part.startsWith("Max-Age="))).toEqual(attributes);
+      expect(cleared.slice(1).filter((part) => !part.startsWith("Max-Age="))).toEqual(attributes);
+    }
+  });
 });
 
 describe("session cookies", () => {
