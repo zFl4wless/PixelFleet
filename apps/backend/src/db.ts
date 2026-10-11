@@ -177,32 +177,39 @@ export function getProfile(userId: string): PlayerProfile | null {
   return row ? toProfile(row) : null;
 }
 
-export function getProfileBySessionToken(token: string | null): PlayerProfile | null {
+export function getSessionByToken(token: string | null): { id: string; profile: PlayerProfile } | null {
   if (!token) {
     return null;
   }
 
+  const id = tokenHash(token);
   const row = db
     .prepare(
       `SELECT users.* FROM sessions
        JOIN users ON users.user_id = sessions.user_id
        WHERE sessions.token_hash = ?`
     )
-    .get(tokenHash(token)) as UserRow | undefined;
+    .get(id) as UserRow | undefined;
 
   if (!row) {
     return null;
   }
 
-  db.prepare("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?").run(now(), tokenHash(token));
-  return toProfile(row);
+  db.prepare("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?").run(now(), id);
+  return { id, profile: toProfile(row) };
 }
 
-export function deleteSession(token: string | null): void {
+export function getProfileBySessionToken(token: string | null): PlayerProfile | null {
+  return getSessionByToken(token)?.profile ?? null;
+}
+
+export function deleteSession(token: string | null): string | null {
   if (!token) {
-    return;
+    return null;
   }
-  db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(tokenHash(token));
+  const id = tokenHash(token);
+  db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(id);
+  return id;
 }
 
 export function updateStatsAfterMatch(userId: string, rewards: MatchRewards): MatchStatsUpdate {

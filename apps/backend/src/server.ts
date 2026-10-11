@@ -10,6 +10,7 @@ import {
   deleteSession,
   getDatabaseStats,
   getProfileBySessionToken,
+  getSessionByToken,
   resetDatabase,
   type ResetScope
 } from "./db.js";
@@ -332,7 +333,10 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && path === "/api/logout") {
-      deleteSession(getSessionToken(req));
+      const sessionId = deleteSession(getSessionToken(req));
+      if (sessionId) {
+        hub.revokeSession(sessionId);
+      }
       res.setHeader("Set-Cookie", clearSessionCookie(isSecureRequest(req)));
       sendJson(res, 200, { ok: true });
       return;
@@ -411,8 +415,8 @@ server.on("upgrade", (req, socket, head) => {
       return;
     }
 
-    const profile = getProfileBySessionToken(getSessionToken(req));
-    if (!profile) {
+    const session = getSessionByToken(getSessionToken(req));
+    if (!session) {
       metrics.inc("ws_connections_rejected_total");
       rejectUpgrade(socket, "401 Unauthorized");
       return;
@@ -443,7 +447,7 @@ server.on("upgrade", (req, socket, head) => {
       upgrade.releaseConnection = releaseConnection;
       heartbeatSocket.once("close", releaseConnection);
 
-      hub.connect(ws, profile, { ip });
+      hub.connect(ws, session.profile, { ip, sessionId: session.id });
     });
   } catch (error) {
     // Failed attempts remain rate-limited; only an acquired active slot is released.

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -148,6 +149,87 @@ async function rejectedUpgrade(url: string, cookie?: string, origin = url): Prom
 }
 
 describe("production deployment", () => {
+  it("revokes logout sockets by session without revoking an independent session of the same account", async () => {
+    const { child, ready } = launch();
+    const url = await ready;
+    const first = await loginGuest(url, "Session-scoped dummy");
+    const independentToken = `independent-dummy-${randomUUID()}`;
+    const independentCookie = `pf_session=${independentToken}`;
+    const fixtureDatabase = new DatabaseSync(join(directory, "pixelfleet.sqlite"));
+    try {
+      const timestamp = new Date().toISOString();
+      fixtureDatabase.prepare("INSERT INTO sessions (token_hash, user_id, created_at, last_seen_at) VALUES (?, ?, ?, ?)")
+        .run(createHash("sha256").update(independentToken).digest("hex"), first.profile.userId, timestamp, timestamp);
+    } finally {
+      fixtureDatabase.close();
+    }
+    const old = await openSessionSocket(url, first.cookie);
+    const replaced = once(old.socket, "close");
+    const current = await openSessionSocket(url, independentCookie);
+    expect((await replaced)[0]).toBe(4001);
+    const other = await loginGuest(url, "Independent account dummy");
+    const unaffected = await openSessionSocket(url, other.cookie);
+    const oldLogout = await fetch(`${url}/api/logout`, {
+      method: "POST", headers: { Origin: url, Cookie: first.cookie }
+    });
+    expect(oldLogout.status).toBe(200);
+    expect(oldLogout.headers.get("set-cookie")).toContain("Max-Age=0");
+    await oldLogout.json();
+    const oldMe = await fetch(`${url}/api/me`, { headers: { Cookie: first.cookie } });
+    expect(oldMe.status).toBe(401);
+    await oldMe.json();
+    expect(await rejectedUpgrade(url, first.cookie)).toBe(401);
+    const currentMe = await fetch(`${url}/api/me`, { headers: { Cookie: independentCookie } });
+    expect(currentMe.status).toBe(200);
+    expect((await currentMe.json()).profile.userId).toBe(first.profile.userId);
+    expect(current.socket.readyState).toBe(WebSocket.OPEN);
+    const queued = once(current.socket, "message");
+    current.socket.send(JSON.stringify({ type: "join_queue" }));
+    expect(JSON.parse((await queued)[0].toString())).toMatchObject({ type: "queue_status", queued: true });
+    const closed = once(current.socket, "close");
+    const logout = await fetch(`${url}/api/logout`, {
+      method: "POST", headers: { Origin: url, Cookie: independentCookie }
+    });
+    expect(logout.status).toBe(200);
+    await logout.json();
+    expect((await closed)[0]).toBe(4003);
+    expect(await rejectedUpgrade(url, independentCookie)).toBe(401);
+    const otherMe = await fetch(`${url}/api/me`, { headers: { Cookie: other.cookie } });
+    expect(otherMe.status).toBe(200);
+    await otherMe.json();
+    expect(unaffected.socket.readyState).toBe(WebSocket.OPEN);
+    const health = await fetch(`${url}/api/health`);
+    expect((await health.json()).hub).toMatchObject({ activeConnections: 1, queuedPlayers: 0 });
+    await stop(child);
+  }, 15_000);
+
+  it("invalidates runtime-reset connections while keeping the session available for reconnect", async () => {
+    const { child, ready } = launch();
+    const url = await ready;
+    const player = await loginGuest(url, "Runtime-reset dummy");
+    const old = await openSessionSocket(url, player.cookie);
+    const queued = once(old.socket, "message");
+    old.socket.send(JSON.stringify({ type: "join_queue" }));
+    expect(JSON.parse((await queued)[0].toString())).toMatchObject({ type: "queue_status", queued: true });
+    const closed = once(old.socket, "close");
+    const reset = await fetch(`${url}/api/admin/reset`, {
+      method: "POST",
+      headers: { Origin: url, Authorization: "Bearer deployment-test-token", "Content-Type": "application/json" },
+      body: JSON.stringify({ scope: "runtime" })
+    });
+    expect(reset.status).toBe(200);
+    expect((await reset.json()).hub).toMatchObject({ activeConnections: 0, queuedPlayers: 0, matches: 0 });
+    expect((await closed)[0]).toBe(4009);
+    const current = await openSessionSocket(url, player.cookie);
+    expect(current.profile.userId).toBe(player.profile.userId);
+    const requeued = once(current.socket, "message");
+    current.socket.send(JSON.stringify({ type: "join_queue" }));
+    expect(JSON.parse((await requeued)[0].toString())).toMatchObject({ type: "queue_status", queued: true });
+    const health = await fetch(`${url}/api/health`);
+    expect((await health.json()).hub).toMatchObject({ activeConnections: 1, queuedPlayers: 1, matches: 0 });
+    await stop(child);
+  }, 15_000);
+
   it("rejects malformed cookies without creating accounts or changing an existing HTTP session", async () => {
     const { child, ready } = launch();
     const url = await ready;

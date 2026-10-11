@@ -32,6 +32,8 @@ interface ClientConnection {
   ws: WebSocket;
   profile: PlayerProfile;
   ip: string;
+  sessionId: string;
+  revoked: boolean;
 }
 
 interface MatchPlayerState {
@@ -69,6 +71,7 @@ export interface HubStats {
 
 interface ClientContext {
   ip: string;
+  sessionId: string;
 }
 
 export class GameHub {
@@ -91,13 +94,17 @@ export class GameHub {
 
   connect(ws: WebSocket, profile: PlayerProfile, context: ClientContext): void {
     const existing = this.connections.get(profile.userId);
+    if (existing) {
+      existing.revoked = true;
+    }
+
+    const connection: ClientConnection = { userId: profile.userId, ws, profile, ...context, revoked: false };
+    this.connections.set(profile.userId, connection);
+    // Also clean up if connection initialization fails before message handlers are installed.
+    ws.on("close", () => this.disconnect(connection));
     if (existing && existing.ws !== ws) {
       existing.ws.close(4001, "New connection opened");
     }
-
-    this.connections.set(profile.userId, { userId: profile.userId, ws, profile, ip: context.ip });
-    // Also clean up if connection initialization fails before message handlers are installed.
-    ws.on("close", () => this.disconnect(profile.userId, ws));
     metrics.inc("ws_connections_accepted_total");
     this.send(profile.userId, { type: "profile", profile });
 
@@ -116,12 +123,33 @@ export class GameHub {
       this.send(profile.userId, { type: "queue_status", queued: true, message: "Searching for an opponent..." });
     }
 
-    ws.on("message", (payload) => this.handleMessage(profile.userId, payload.toString()));
+    ws.on("message", (payload) => {
+      if (this.isCurrentConnection(connection)) {
+        this.handleMessage(connection, payload.toString());
+      }
+    });
   }
 
-  private disconnect(userId: string, ws: WebSocket): void {
-    const current = this.connections.get(userId);
-    if (!current || current.ws !== ws) {
+  private isCurrentConnection(connection: ClientConnection): boolean {
+    return !connection.revoked && connection.ws.readyState === WebSocket.OPEN &&
+      this.connections.get(connection.userId) === connection;
+  }
+
+  revokeSession(sessionId: string): void {
+    const connections = [...this.connections.values()].filter((connection) => connection.sessionId === sessionId);
+    for (const connection of connections) {
+      connection.revoked = true;
+    }
+    for (const connection of connections) {
+      this.disconnect(connection);
+      connection.ws.close(4003, "Session revoked");
+    }
+  }
+
+  private disconnect(connection: ClientConnection): void {
+    connection.revoked = true;
+    const { userId } = connection;
+    if (this.connections.get(userId) !== connection) {
       return;
     }
 
@@ -162,17 +190,18 @@ export class GameHub {
     match.reconnectTimers.set(userId, timer);
   }
 
-  private handleMessage(userId: string, raw: string): void {
+  private handleMessage(connection: ClientConnection, raw: string): void {
+    const { userId } = connection;
     metrics.inc("ws_messages_total");
 
     if (Buffer.byteLength(raw, "utf8") > MAX_WS_PAYLOAD_BYTES) {
-      this.rejectAction(userId, "Message payload is too large.", true);
+      this.rejectAction(connection, "Message payload is too large.", true);
       return;
     }
 
     const messageLimit = this.messageLimiter.check(userId);
     if (!messageLimit.allowed) {
-      this.rejectAction(userId, "Slow down. You are sending too many actions.", true);
+      this.rejectAction(connection, "Slow down. You are sending too many actions.", true);
       return;
     }
 
@@ -180,7 +209,7 @@ export class GameHub {
     try {
       message = JSON.parse(raw) as ClientMessage;
     } catch {
-      this.rejectAction(userId, "Invalid message.");
+      this.rejectAction(connection, "Invalid message.");
       return;
     }
 
@@ -206,10 +235,10 @@ export class GameHub {
           this.leaveMatch(userId);
           break;
         default:
-          this.rejectAction(userId, "Unknown action.");
+          this.rejectAction(connection, "Unknown action.");
       }
     } catch (error) {
-      this.rejectAction(userId, error instanceof Error ? error.message : "Action rejected.");
+      this.rejectAction(connection, error instanceof Error ? error.message : "Action rejected.");
     }
   }
 
@@ -568,7 +597,11 @@ export class GameHub {
     this.send(userId, { type: "toast", tone: "danger", message });
   }
 
-  private rejectAction(userId: string, message: string, closeConnection = false): void {
+  private rejectAction(connection: ClientConnection, message: string, closeConnection = false): void {
+    if (!this.isCurrentConnection(connection)) {
+      return;
+    }
+    const { userId } = connection;
     metrics.inc("ws_messages_rejected_total");
     metrics.event("security", `Rejected action for user ${userId}: ${message}`);
     this.sendError(userId, message);
@@ -577,8 +610,7 @@ export class GameHub {
     this.invalidActionCounts.set(userId, invalidCount);
 
     if (closeConnection || invalidCount >= 8) {
-      const connection = this.connections.get(userId);
-      connection?.ws.close(4008, "Too many invalid actions");
+      connection.ws.close(4008, "Too many invalid actions");
     }
   }
 
@@ -623,7 +655,7 @@ export class GameHub {
 
   private send(userId: string, message: ServerMessage): void {
     const connection = this.connections.get(userId);
-    if (!connection || connection.ws.readyState !== WebSocket.OPEN) {
+    if (!connection || !this.isCurrentConnection(connection)) {
       return;
     }
     connection.ws.send(JSON.stringify(message));
@@ -642,14 +674,14 @@ export class GameHub {
   }
 
   resetRuntime(closeCode = 4009, closeReason = "Admin reset"): HubStats {
+    const connections = [...this.connections.values()];
+    for (const connection of connections) {
+      connection.revoked = true;
+    }
     for (const match of this.matches.values()) {
       for (const timer of match.reconnectTimers.values()) {
         clearTimeout(timer);
       }
-    }
-
-    for (const connection of this.connections.values()) {
-      connection.ws.close(closeCode, closeReason);
     }
 
     this.connections.clear();
@@ -659,6 +691,9 @@ export class GameHub {
     this.queueLimiter.reset();
     this.fireLimiter.reset();
     this.invalidActionCounts.clear();
+    for (const connection of connections) {
+      connection.ws.close(closeCode, closeReason);
+    }
     return this.stats();
   }
 }
