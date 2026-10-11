@@ -8,6 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
+import type { ServerMessage } from "@pixelfleet/shared";
 
 let directory: string;
 const children: ChildProcess[] = [];
@@ -149,6 +150,71 @@ async function rejectedUpgrade(url: string, cookie?: string, origin = url): Prom
 }
 
 describe("production deployment", () => {
+  it("reconnects to the new active match while the previous result is still retained", async () => {
+    const { child, ready } = launch();
+    const url = await ready;
+    const player = await loginGuest(url, "Returning match dummy");
+    const oldOpponent = await loginGuest(url, "Previous match dummy");
+    const newOpponent = await loginGuest(url, "Next match dummy");
+    const first = (await openSessionSocket(url, player.cookie)).socket;
+    const previous = (await openSessionSocket(url, oldOpponent.cookie)).socket;
+    const next = (await openSessionSocket(url, newOpponent.cookie)).socket;
+    function waitView(socket: WebSocket, predicate: (message: Extract<ServerMessage, { type: "game_update" | "match_finished" }>) => boolean) {
+      return new Promise<Extract<ServerMessage, { type: "game_update" | "match_finished" }>["view"]>((resolve, reject) => {
+        const onMessage = (data: WebSocket.RawData) => {
+          const message = JSON.parse(data.toString()) as ServerMessage;
+          if ((message.type === "game_update" || message.type === "match_finished") && predicate(message)) {
+            cleanup();
+            resolve(message.view);
+          }
+        };
+        const onError = (error: Error) => { cleanup(); reject(error); };
+        const onClose = () => { cleanup(); reject(new Error("Socket closed before the expected match view.")); };
+        function cleanup() {
+          socket.off("message", onMessage);
+          socket.off("error", onError);
+          socket.off("close", onClose);
+        }
+        socket.on("message", onMessage);
+        socket.once("error", onError);
+        socket.once("close", onClose);
+      });
+    }
+    const matched = waitView(first, (message) => message.view.phase === "placing");
+    const queued = once(first, "message");
+    first.send(JSON.stringify({ type: "join_queue" }));
+    expect(JSON.parse((await queued)[0].toString())).toMatchObject({ type: "queue_status", queued: true });
+    previous.send(JSON.stringify({ type: "join_queue" }));
+    const oldView = await matched;
+    const finished = waitView(first, (message) => message.type === "match_finished");
+    first.send(JSON.stringify({ type: "leave_match" }));
+    expect(await finished).toMatchObject({ matchId: oldView.matchId, result: { reason: "forfeit" } });
+    const newMatch = waitView(first, (message) => message.view.phase === "placing");
+    const requeued = once(first, "message");
+    first.send(JSON.stringify({ type: "join_queue" }));
+    expect(JSON.parse((await requeued)[0].toString())).toMatchObject({ type: "queue_status", queued: true });
+    next.send(JSON.stringify({ type: "join_queue" }));
+    const newView = await newMatch;
+    expect(newView.matchId).not.toBe(oldView.matchId);
+    const disconnected = waitView(next, (message) => message.view.opponent.connected === false);
+    const closed = once(first, "close");
+    first.close();
+    expect(await disconnected).toMatchObject({ matchId: newView.matchId, opponent: { connected: false } });
+    await closed;
+    const current = new WebSocket(`${url.replace("http:", "ws:")}/ws`, {
+      headers: { Cookie: player.cookie, Origin: url }, handshakeTimeout: 2_000
+    });
+    sockets.push(current);
+    const recovered = waitView(current, (message) => message.view.you.connected);
+    const opponentRecovered = waitView(next, (message) => message.view.opponent.connected);
+    const [, recoveredView, opponentView] = await Promise.all([once(current, "open"), recovered, opponentRecovered]);
+    expect(recoveredView).toMatchObject({ matchId: newView.matchId, phase: "placing" });
+    expect(opponentView.reconnectDeadline).toBeUndefined();
+    const health = await fetch(`${url}/api/health`);
+    expect((await health.json()).hub).toMatchObject({ placingMatches: 1, finishedMatches: 1, queuedPlayers: 0 });
+    await stop(child);
+  }, 15_000);
+
   it("revokes logout sockets by session without revoking an independent session of the same account", async () => {
     const { child, ready } = launch();
     const url = await ready;

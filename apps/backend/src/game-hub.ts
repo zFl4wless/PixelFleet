@@ -78,6 +78,7 @@ export class GameHub {
   private readonly connections = new Map<string, ClientConnection>();
   private readonly queue: string[] = [];
   private readonly matches = new Map<string, MatchState>();
+  private readonly activeMatchByUser = new Map<string, MatchId>();
   private readonly messageLimiter = new FixedWindowRateLimiter({
     limit: parseEnvInt("WS_MESSAGES_PER_10S", 120),
     windowMs: 10_000
@@ -108,8 +109,8 @@ export class GameHub {
     metrics.inc("ws_connections_accepted_total");
     this.send(profile.userId, { type: "profile", profile });
 
-    const match = this.findMatchForUser(profile.userId);
-    if (match && match.phase !== "finished") {
+    const match = this.findActiveMatchForUser(profile.userId);
+    if (match) {
       const player = this.getPlayer(match, profile.userId);
       player.connected = true;
       player.disconnectDeadline = undefined;
@@ -156,7 +157,7 @@ export class GameHub {
     this.connections.delete(userId);
     this.removeFromQueue(userId);
 
-    const match = this.findMatchForUser(userId);
+    const match = this.findActiveMatchForUser(userId) ?? this.findFinishedMatchForUser(userId);
     if (!match) {
       return;
     }
@@ -243,8 +244,7 @@ export class GameHub {
   }
 
   private joinQueue(userId: string): void {
-    const activeMatch = this.findMatchForUser(userId);
-    if (activeMatch && activeMatch.phase !== "finished") {
+    if (this.findActiveMatchForUser(userId)) {
       this.sendError(userId, "You are already in a match.");
       return;
     }
@@ -254,14 +254,14 @@ export class GameHub {
       return;
     }
 
-    const opponentId = this.queue.find((queuedId) => queuedId !== userId && this.connections.has(queuedId));
+    const opponentId = this.queue.find((queuedId) => queuedId !== userId && this.connections.has(queuedId) &&
+      !this.findActiveMatchForUser(queuedId));
     if (!opponentId) {
       this.queue.push(userId);
       this.send(userId, { type: "queue_status", queued: true, message: "Searching for an opponent..." });
       return;
     }
 
-    this.removeFromQueue(opponentId);
     this.createMatch(userId, opponentId);
   }
 
@@ -271,6 +271,9 @@ export class GameHub {
   }
 
   private createMatch(userA: string, userB: string): void {
+    if (userA === userB || this.findActiveMatchForUser(userA) || this.findActiveMatchForUser(userB)) {
+      throw new Error("Player is already in an active match.");
+    }
     const profileA = getProfile(userA);
     const profileB = getProfile(userB);
     if (!profileA || !profileB) {
@@ -288,6 +291,10 @@ export class GameHub {
     };
 
     this.matches.set(match.id, match);
+    this.activeMatchByUser.set(userA, match.id);
+    this.activeMatchByUser.set(userB, match.id);
+    this.removeFromQueue(userA);
+    this.removeFromQueue(userB);
     metrics.inc("matches_created_total");
     this.send(userA, { type: "queue_status", queued: false, message: "Match found!" });
     this.send(userB, { type: "queue_status", queued: false, message: "Match found!" });
@@ -393,6 +400,11 @@ export class GameHub {
 
     match.phase = "finished";
     match.currentTurnUserId = null;
+    for (const player of match.players) {
+      if (this.activeMatchByUser.get(player.userId) === match.id) {
+        this.activeMatchByUser.delete(player.userId);
+      }
+    }
     metrics.inc("matches_finished_total");
 
     for (const timer of match.reconnectTimers.values()) {
@@ -426,7 +438,7 @@ export class GameHub {
   }
 
   private leaveMatch(userId: string): void {
-    const match = this.findMatchForUser(userId);
+    const match = this.findActiveMatchForUser(userId) ?? this.findFinishedMatchForUser(userId);
     if (!match) {
       return;
     }
@@ -449,16 +461,29 @@ export class GameHub {
   }
 
   private requireActiveMatch(userId: string): MatchState {
-    const match = this.findMatchForUser(userId);
-    if (!match || match.phase === "finished") {
+    const match = this.findActiveMatchForUser(userId);
+    if (!match) {
       throw new Error("No active match found.");
     }
     return match;
   }
 
-  private findMatchForUser(userId: string): MatchState | null {
+  private findActiveMatchForUser(userId: string): MatchState | null {
+    const matchId = this.activeMatchByUser.get(userId);
+    if (matchId === undefined) {
+      return null;
+    }
+    const match = this.matches.get(matchId);
+    if (!match || match.phase === "finished" || !match.players.some((player) => player.userId === userId)) {
+      throw new Error("Active match membership is inconsistent.");
+    }
+    return match;
+  }
+
+  private findFinishedMatchForUser(userId: string): MatchState | null {
     for (const match of this.matches.values()) {
-      if (match.players.some((player) => player.userId === userId) && !match.leftAfterFinish.has(userId)) {
+      if (match.phase === "finished" && match.players.some((player) => player.userId === userId) &&
+        !match.leftAfterFinish.has(userId)) {
         return match;
       }
     }
@@ -687,6 +712,7 @@ export class GameHub {
     this.connections.clear();
     this.queue.length = 0;
     this.matches.clear();
+    this.activeMatchByUser.clear();
     this.messageLimiter.reset();
     this.queueLimiter.reset();
     this.fireLimiter.reset();
