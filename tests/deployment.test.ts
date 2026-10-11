@@ -93,9 +93,9 @@ async function loginGuest(url: string, username = "Cookie test guest") {
   return { cookie, profile };
 }
 
-async function openSessionSocket(url: string, cookie: string) {
+async function openSessionSocket(url: string, cookie: string, origin = url) {
   const socket = new WebSocket(`${url.replace("http:", "ws:")}/ws`, {
-    headers: { Cookie: cookie, Origin: url },
+    headers: { Cookie: cookie, Origin: origin },
     handshakeTimeout: 2_000
   });
   sockets.push(socket);
@@ -150,6 +150,46 @@ async function rejectedUpgrade(url: string, cookie?: string, origin = url): Prom
 }
 
 describe("production deployment", () => {
+  it.each(["development", "production"])("keeps HTTP, CORS and WebSocket origin decisions consistent in %s", async (mode) => {
+    const { child, ready } = launch({ NODE_ENV: mode });
+    const url = await ready;
+    const { cookie, profile } = await loginGuest(url, "Origin policy dummy");
+    const origins: [string, boolean][] = [
+      ["http://localhost:5173", true], ["https://app.localhost:5179", true],
+      ["http://192.168.1.251:5174", true], ["http://[::1]:5173", true],
+      ["http://[fd00::1]:5173", true], ["http://[fe80::1]:5173", true],
+      ["http://fc-assets.example:5173", false], ["http://fd-cdn.example:5173", false],
+      ["http://localhost:5180", false], ["http://[2001:db8::1]:5173", false],
+      ["http://[fdgg::1]:5173", false], [url, true]
+    ];
+    for (const [origin, devAllowed] of origins) {
+      const allowed = origin === url || (mode === "development" && devAllowed);
+      const preflight = await fetch(`${url}/api/guest-login`, { method: "OPTIONS", headers: { Origin: origin } });
+      expect(preflight.status).toBe(204);
+      expect(preflight.headers.get("access-control-allow-origin")).toBe(allowed ? origin : null);
+      expect(preflight.headers.get("access-control-allow-credentials")).toBe(allowed ? "true" : null);
+      await preflight.text();
+      const login = await fetch(`${url}/api/guest-login`, {
+        method: "POST", headers: { Origin: origin, Cookie: cookie }
+      });
+      expect(login.status).toBe(allowed ? 200 : 403);
+      expect(login.headers.get("access-control-allow-origin")).toBe(allowed ? origin : null);
+      const body = await login.json();
+      if (allowed) {
+        expect(body.profile.userId).toBe(profile.userId);
+        const { socket, profile: socketProfile } = await openSessionSocket(url, cookie, origin);
+        expect(socketProfile.userId).toBe(profile.userId);
+        const closed = once(socket, "close");
+        socket.close();
+        await closed;
+      } else {
+        expect(body.error).toBe("Untrusted origin.");
+        expect(await rejectedUpgrade(url, cookie, origin)).toBe(403);
+      }
+    }
+    await stop(child);
+  }, 15_000);
+
   it("reconnects to the new active match while the previous result is still retained", async () => {
     const { child, ready } = launch();
     const url = await ready;

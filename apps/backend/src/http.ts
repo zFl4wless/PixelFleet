@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { isIP } from "node:net";
 
 const SESSION_COOKIE_NAME = "pf_session";
 const ONE_YEAR_SECONDS = 60 * 60 * 24 * 365;
@@ -109,16 +110,22 @@ function isPrivateIpv4(hostname: string): boolean {
 
 function isLocalOrPrivateHostname(hostname: string): boolean {
   const normalized = normalizeHostname(hostname);
-  return (
-    normalized === "localhost" ||
-    normalized.endsWith(".localhost") ||
-    normalized === "::1" ||
-    normalized === "0:0:0:0:0:0:0:1" ||
-    normalized.startsWith("fe80:") ||
-    normalized.startsWith("fc") ||
-    normalized.startsWith("fd") ||
-    isPrivateIpv4(normalized)
-  );
+  if (normalized === "localhost" || normalized.endsWith(".localhost")) {
+    return true;
+  }
+
+  const addressType = isIP(normalized);
+  if (addressType === 4) {
+    return isPrivateIpv4(normalized);
+  }
+  if (addressType !== 6) {
+    return false;
+  }
+
+  const firstHextet = Number.parseInt(normalized.split(":")[0], 16);
+  return normalized === "::1" || normalized === "0:0:0:0:0:0:0:1" ||
+    firstHextet === 0xfe80 || // Preserve the existing link-local allowance: fe80::/16.
+    (firstHextet & 0xfe00) === 0xfc00; // Unique local: fc00::/7.
 }
 
 function isViteDevOrigin(origin: string): boolean {
