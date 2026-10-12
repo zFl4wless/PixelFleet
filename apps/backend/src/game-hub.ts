@@ -16,17 +16,30 @@ import {
   type PublicCell,
   type PublicMatchView,
   type ServerMessage,
+  type SessionState,
   type ShipPlacement,
   type ShotOutcome,
   validateFleet
 } from "@pixelfleet/shared";
-import { getProfile, updateStatsAfterMatch } from "./db.js";
+import { completeMatch, getProfile, MatchCompletionConflict, type MatchCompletion } from "./db.js";
 import { metrics } from "./metrics.js";
 import { FixedWindowRateLimiter, parseEnvInt } from "./rate-limit.js";
 
 const RECONNECT_GRACE_MS = 30_000;
+const COMPLETION_RETRY_MS = 1000;
+const COMPLETION_ATTEMPTS = 3;
 const MAX_TIMEOUT_MS = 2 ** 31 - 1;
-const MAX_WS_PAYLOAD_BYTES = parseEnvInt("MAX_WS_PAYLOAD_BYTES", 4096);
+export const MAX_WS_PAYLOAD_BYTES = parseEnvInt("MAX_WS_PAYLOAD_BYTES", 4096);
+
+function finishedMatchRetentionMs(): number {
+  const raw = process.env.FINISHED_MATCH_RETENTION_MS;
+  if (raw === undefined || raw === "") return 600_000;
+  const value = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < 1 || value > 600_000) {
+    throw new Error("FINISHED_MATCH_RETENTION_MS must be an integer from 1 to 600000 milliseconds.");
+  }
+  return value;
+}
 
 interface ClientConnection {
   userId: string;
@@ -37,6 +50,7 @@ interface ClientConnection {
   expiresAt: number;
   expiryTimer?: NodeJS.Timeout;
   revoked: boolean;
+  initialized: boolean;
 }
 
 interface MatchPlayerState {
@@ -61,6 +75,18 @@ interface MatchState {
   results: Map<string, MatchResult>;
   leftAfterFinish: Set<string>;
   reconnectTimers: Map<string, NodeJS.Timeout>;
+  completion?: {
+    decision: MatchCompletion;
+    attempts: number;
+    failed: boolean;
+    retryTimer?: NodeJS.Timeout;
+  };
+}
+
+interface RetainedMatch {
+  match: MatchState;
+  expiresAt: number;
+  expiryTimer: NodeJS.Timeout;
 }
 
 export interface HubStats {
@@ -83,6 +109,8 @@ export class GameHub {
   private readonly queue: string[] = [];
   private readonly matches = new Map<string, MatchState>();
   private readonly activeMatchByUser = new Map<string, MatchId>();
+  private readonly finishedMatches = new Map<MatchId, RetainedMatch>();
+  private readonly resultRetentionMs = finishedMatchRetentionMs();
   private readonly messageLimiter = new FixedWindowRateLimiter({
     limit: parseEnvInt("WS_MESSAGES_PER_10S", 120),
     windowMs: 10_000
@@ -95,7 +123,8 @@ export class GameHub {
     limit: parseEnvInt("FIRE_ACTIONS_PER_10S", 120),
     windowMs: 10_000
   });
-  private readonly invalidActionCounts = new Map<string, number>();
+  // The eighth rejection fails this budget; denied checks never extend its fixed window.
+  private readonly invalidActionLimiter = new FixedWindowRateLimiter({ limit: 7, windowMs: 60_000 });
 
   connect(ws: WebSocket, profile: PlayerProfile, context: ClientContext): void {
     // The deadline may have passed between HTTP authentication and upgrade completion.
@@ -109,9 +138,11 @@ export class GameHub {
       this.clearSessionExpiry(existing);
     }
 
-    const connection: ClientConnection = { userId: profile.userId, ws, profile, ...context, revoked: false };
+    const connection: ClientConnection = { userId: profile.userId, ws, profile, ...context, revoked: false, initialized: false };
     this.connections.set(profile.userId, connection);
-    // Also clean up if connection initialization fails before message handlers are installed.
+    // Both events share idempotent cleanup, including errors during initialization.
+    // Keep the error listener after close so late errors from old sockets stay contained.
+    ws.on("error", () => this.disconnect(connection));
     ws.on("close", () => this.disconnect(connection));
     if (existing && existing.ws !== ws) {
       existing.ws.close(4001, "New connection opened");
@@ -119,10 +150,16 @@ export class GameHub {
     this.scheduleSessionExpiry(connection);
     if (!this.isCurrentConnection(connection)) return;
     metrics.inc("ws_connections_accepted_total");
-    this.send(profile.userId, { type: "profile", profile });
-    if (!this.isCurrentConnection(connection)) return;
-
-    const match = this.findActiveMatchForUser(profile.userId);
+    let match = this.findActiveMatchForUser(profile.userId);
+    // Enforce a due grace deadline even if its callback is still waiting in the loop.
+    if (match && !match.completion) {
+      // Map order also preserves the original timeout order for equal deadlines.
+      const expired = [...match.reconnectTimers.keys()].map((userId) => this.getPlayer(match!, userId))
+        .filter((player) => !player.connected && player.disconnectDeadline !== undefined && player.disconnectDeadline <= Date.now())
+        .sort((a, b) => a.disconnectDeadline! - b.disconnectDeadline!)[0];
+      if (expired) this.finishMatch(match, this.getOpponent(match, expired.userId).userId, "forfeit");
+      match = this.findActiveMatchForUser(profile.userId);
+    }
     if (match) {
       const player = this.getPlayer(match, profile.userId);
       player.connected = true;
@@ -132,9 +169,16 @@ export class GameHub {
         clearTimeout(timer);
         match.reconnectTimers.delete(profile.userId);
       }
-      this.broadcastGameUpdate(match, "Opponent reconnected.");
-    } else if (this.queue.includes(profile.userId)) {
-      this.send(profile.userId, { type: "queue_status", queued: true, message: "Searching for an opponent..." });
+    }
+
+    // Initialization is synchronous: queue this complete state first, then enable
+    // actions/live messages. WebSocket preserves that order; no await can interleave.
+    this.sendSnapshot(profile.userId);
+    if (!this.isCurrentConnection(connection)) return;
+    connection.initialized = true;
+    if (match) {
+      const opponent = this.getOpponent(match, profile.userId);
+      this.send(opponent.userId, { type: "game_update", view: this.createView(match, opponent.userId, "Opponent reconnected.") });
     }
 
     ws.on("message", (payload) => {
@@ -142,6 +186,17 @@ export class GameHub {
         this.handleMessage(connection, payload.toString());
       }
     });
+  }
+
+  private sendSnapshot(userId: string): void {
+    const profile = getProfile(userId);
+    if (!profile) throw new Error("Snapshot account no longer exists.");
+    const active = this.findActiveMatchForUser(userId);
+    const queued = this.queue.includes(userId);
+    const match = active ?? (queued ? null : this.findFinishedMatchForUser(userId));
+    const state: SessionState = match ? { kind: "match", view: this.createView(match, userId) }
+      : queued ? { kind: "queue" } : { kind: "lobby" };
+    this.send(userId, { type: "session_snapshot", profile, state });
   }
 
   private isCurrentConnection(connection: ClientConnection): boolean {
@@ -194,27 +249,23 @@ export class GameHub {
     this.connections.delete(userId);
     this.removeFromQueue(userId);
 
-    const match = this.findActiveMatchForUser(userId) ?? this.findFinishedMatchForUser(userId);
+    const match = this.findActiveMatchForUser(userId);
     if (!match) {
-      return;
-    }
-
-    if (match.phase === "finished") {
-      match.leftAfterFinish.add(userId);
-      if (match.leftAfterFinish.size === match.players.length) {
-        this.matches.delete(match.id);
-      }
       return;
     }
 
     const player = this.getPlayer(match, userId);
     player.connected = false;
+    if (match.completion) {
+      this.broadcastGameUpdate(match);
+      return;
+    }
     player.disconnectDeadline = Date.now() + RECONNECT_GRACE_MS;
     this.broadcastGameUpdate(match, "A player is offline. Reconnect window is active.");
 
     const timer = setTimeout(() => {
       const freshMatch = this.matches.get(match.id);
-      if (!freshMatch || freshMatch.phase === "finished") {
+      if (!freshMatch || freshMatch.phase === "finished" || freshMatch.completion) {
         return;
       }
 
@@ -253,6 +304,11 @@ export class GameHub {
 
     try {
       this.validateClientMessage(message);
+      const pending = this.findActiveMatchForUser(userId);
+      if (pending?.completion) {
+        this.sendError(userId, this.completionMessage(pending));
+        return;
+      }
       switch (message.type) {
         case "join_queue":
           this.assertActionAllowed(this.queueLimiter, userId, "Too many queue actions. Try again shortly.");
@@ -431,12 +487,69 @@ export class GameHub {
   }
 
   private finishMatch(match: MatchState, winnerId: string, reason: "ships_sunk" | "forfeit"): void {
-    if (match.phase === "finished") {
+    if (match.phase === "finished" || match.completion) {
       return;
     }
 
-    match.phase = "finished";
+    // Freeze the already-mutated final shot and decision before any fallible write.
+    match.completion = {
+      decision: {
+        matchId: match.id, winnerId, reason,
+        players: match.players.map(({ userId, shotsFired, hits, shipsSunk }) => ({ userId, shotsFired, hits, shipsSunk }))
+      },
+      attempts: 0,
+      failed: false
+    };
     match.currentTurnUserId = null;
+    for (const timer of match.reconnectTimers.values()) clearTimeout(timer);
+    match.reconnectTimers.clear();
+    for (const player of match.players) player.disconnectDeadline = undefined;
+    this.persistCompletion(match);
+  }
+
+  private completionMessage(match: MatchState): string {
+    return match.completion?.failed
+      ? "Match result could not be saved. Play is stopped; please contact the administrator."
+      : "Saving match result. Play is stopped; retrying automatically.";
+  }
+
+  private persistCompletion(match: MatchState): void {
+    const pending = match.completion;
+    // A cancelled timer already queued by the event loop cannot revive a reset match.
+    if (!pending || this.matches.get(match.id) !== match || pending.failed) return;
+    pending.attempts += 1;
+    let results: Map<string, MatchResult>;
+    try {
+      const saved = completeMatch(pending.decision);
+      results = new Map(saved.updates.map((update) => {
+        if (!update.profile) throw new Error("Completed match account no longer exists.");
+        return [update.userId, {
+          winnerId: pending.decision.winnerId, reason: pending.decision.reason,
+          won: update.userId === pending.decision.winnerId, xpEarned: update.xpEarned, profile: update.profile
+        }];
+      }));
+    } catch (error) {
+      pending.failed = pending.attempts >= COMPLETION_ATTEMPTS || error instanceof MatchCompletionConflict;
+      metrics.event("error", `Match ${match.id} completion attempt ${pending.attempts} failed: ${error instanceof Error ? error.message : "storage error"}`);
+      if (!pending.failed) {
+        pending.retryTimer = setTimeout(() => {
+          pending.retryTimer = undefined;
+          this.persistCompletion(match);
+        }, COMPLETION_RETRY_MS);
+      }
+      this.broadcastGameUpdate(match);
+      return;
+    }
+
+    // Publish only after the receipt and both rewards have committed together.
+    match.results = results;
+    match.completion = undefined;
+    match.phase = "finished";
+    // Results have a separate lifetime; their cleanup must never remove a newer membership.
+    this.matches.delete(match.id);
+    const expiresAt = Date.now() + this.resultRetentionMs;
+    const expiryTimer = setTimeout(() => this.deleteFinishedMatch(match.id), this.resultRetentionMs);
+    this.finishedMatches.set(match.id, { match, expiresAt, expiryTimer });
     for (const player of match.players) {
       if (this.activeMatchByUser.get(player.userId) === match.id) {
         this.activeMatchByUser.delete(player.userId);
@@ -444,29 +557,8 @@ export class GameHub {
     }
     metrics.inc("matches_finished_total");
 
-    for (const timer of match.reconnectTimers.values()) {
-      clearTimeout(timer);
-    }
-    match.reconnectTimers.clear();
-
     for (const player of match.players) {
-      const won = player.userId === winnerId;
-      const update = updateStatsAfterMatch(player.userId, {
-        won,
-        hits: player.hits,
-        shipsSunk: player.shipsSunk,
-        shotsFired: player.shotsFired
-      });
-
-      match.results.set(player.userId, {
-        winnerId,
-        reason,
-        xpEarned: update.xpEarned,
-        won,
-        profile: update.profile
-      });
-
-      this.send(player.userId, { type: "profile", profile: update.profile });
+      this.send(player.userId, { type: "profile", profile: results.get(player.userId)!.profile });
     }
 
     for (const player of match.players) {
@@ -493,7 +585,7 @@ export class GameHub {
     }
 
     if (match.leftAfterFinish.size === match.players.length) {
-      this.matches.delete(match.id);
+      this.deleteFinishedMatch(match.id);
     }
   }
 
@@ -518,13 +610,26 @@ export class GameHub {
   }
 
   private findFinishedMatchForUser(userId: string): MatchState | null {
-    for (const match of this.matches.values()) {
-      if (match.phase === "finished" && match.players.some((player) => player.userId === userId) &&
+    let latest: MatchState | null = null;
+    for (const { match, expiresAt } of this.finishedMatches.values()) {
+      // Do not replay expired results if the event loop delayed their timer callbacks.
+      if (Date.now() >= expiresAt) {
+        this.deleteFinishedMatch(match.id);
+        continue;
+      }
+      if (match.players.some((player) => player.userId === userId) &&
         !match.leftAfterFinish.has(userId)) {
-        return match;
+        latest = match;
       }
     }
-    return null;
+    return latest;
+  }
+
+  private deleteFinishedMatch(matchId: MatchId): void {
+    const retained = this.finishedMatches.get(matchId);
+    if (!retained) return;
+    clearTimeout(retained.expiryTimer);
+    this.finishedMatches.delete(matchId);
   }
 
   private getPlayer(match: MatchState, userId: string): MatchPlayerState {
@@ -557,13 +662,13 @@ export class GameHub {
 
     return {
       matchId: match.id,
-      phase: match.phase,
+      phase: match.completion ? (match.completion.failed ? "save_failed" : "saving") : match.phase,
       you: this.toPublicPlayer(you),
       opponent: this.toPublicPlayer(opponent),
       currentTurnUserId: match.currentTurnUserId,
       ownBoard: this.createOwnBoard(you, opponent),
       enemyBoard: this.createEnemyBoard(you, opponent),
-      message: overrideMessage ?? this.defaultMessage(match, userId),
+      message: match.completion ? this.completionMessage(match) : overrideMessage ?? this.defaultMessage(match, userId),
       result,
       reconnectDeadline: opponent.disconnectDeadline
     };
@@ -668,10 +773,8 @@ export class GameHub {
     metrics.event("security", `Rejected action for user ${userId}: ${message}`);
     this.sendError(userId, message);
 
-    const invalidCount = (this.invalidActionCounts.get(userId) ?? 0) + 1;
-    this.invalidActionCounts.set(userId, invalidCount);
-
-    if (closeConnection || invalidCount >= 8) {
+    const invalidAction = this.invalidActionLimiter.check(userId);
+    if (closeConnection || !invalidAction.allowed) {
       connection.ws.close(4008, "Too many invalid actions");
     }
   }
@@ -717,7 +820,7 @@ export class GameHub {
 
   private send(userId: string, message: ServerMessage): void {
     const connection = this.connections.get(userId);
-    if (!connection || !this.isCurrentConnection(connection)) {
+    if (!connection || !this.isCurrentConnection(connection) || (!connection.initialized && message.type !== "session_snapshot")) {
       return;
     }
     connection.ws.send(JSON.stringify(message));
@@ -728,11 +831,19 @@ export class GameHub {
     return {
       activeConnections: this.connections.size,
       queuedPlayers: this.queue.length,
-      matches: matches.length,
+      matches: matches.length + this.finishedMatches.size,
       placingMatches: matches.filter((match) => match.phase === "placing").length,
       playingMatches: matches.filter((match) => match.phase === "playing").length,
-      finishedMatches: matches.filter((match) => match.phase === "finished").length
+      finishedMatches: this.finishedMatches.size
     };
+  }
+
+  // Called by the server's maintenance interval, independently of client activity.
+  pruneRateLimits(now = Date.now()): void {
+    this.messageLimiter.prune(now);
+    this.queueLimiter.prune(now);
+    this.fireLimiter.prune(now);
+    this.invalidActionLimiter.prune(now);
   }
 
   resetRuntime(closeCode = 4009, closeReason = "Admin reset"): HubStats {
@@ -742,10 +853,14 @@ export class GameHub {
       this.clearSessionExpiry(connection);
     }
     for (const match of this.matches.values()) {
+      if (match.completion?.retryTimer) clearTimeout(match.completion.retryTimer);
+      match.completion = undefined;
       for (const timer of match.reconnectTimers.values()) {
         clearTimeout(timer);
       }
+      match.reconnectTimers.clear();
     }
+    for (const matchId of this.finishedMatches.keys()) this.deleteFinishedMatch(matchId);
 
     this.connections.clear();
     this.queue.length = 0;
@@ -754,7 +869,7 @@ export class GameHub {
     this.messageLimiter.reset();
     this.queueLimiter.reset();
     this.fireLimiter.reset();
-    this.invalidActionCounts.clear();
+    this.invalidActionLimiter.reset();
     for (const connection of connections) {
       connection.ws.close(closeCode, closeReason);
     }

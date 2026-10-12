@@ -10,12 +10,14 @@ import type { GameHub as Hub } from "../apps/backend/src/game-hub";
 class TestSocket extends EventEmitter {
   readyState: number = WebSocket.OPEN;
   sent: ServerMessage[] = [];
+  closes: { code?: number; reason?: string }[] = [];
 
   send(raw: string) {
     this.sent.push(JSON.parse(raw));
   }
 
-  close() {
+  close(code?: number, reason?: string) {
+    this.closes.push({ code, reason });
     this.readyState = WebSocket.CLOSED;
     this.emit("close");
   }
@@ -54,6 +56,7 @@ afterEach(() => {
   hub.resetRuntime();
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 afterAll(async () => {
@@ -76,11 +79,13 @@ function connect(player: ReturnType<typeof guest>) {
 }
 
 function view(socket: TestSocket) {
-  const message = socket.sent.filter((item) => item.type === "game_update" || item.type === "match_finished").at(-1);
-  if (!message || (message.type !== "game_update" && message.type !== "match_finished")) {
-    throw new Error("Expected a match view.");
-  }
-  return message.view;
+  const views = socket.sent.flatMap((item) => {
+    if (item.type === "session_snapshot") return item.state.kind === "match" ? [item.state.view] : [];
+    return item.type === "game_update" || item.type === "match_finished" ? [item.view] : [];
+  });
+  const latest = views.at(-1);
+  if (!latest) throw new Error("Expected a match view.");
+  return latest;
 }
 
 function pair(first: TestSocket, second: TestSocket) {
@@ -242,5 +247,239 @@ describe("unique active match membership", () => {
     expect(view(current)).toMatchObject({ matchId: newId, phase: "placing", you: { connected: true } });
     expect(hub.stats()).toMatchObject({ placingMatches: 1, finishedMatches: 0 });
     expect(database.getProfile(firstPlayer.profile.userId)?.stats.gamesPlayed).toBe(0);
+  });
+});
+
+describe("finished match retention (TD-02)", () => {
+  const retention = 600_000;
+
+  beforeEach(() => vi.useFakeTimers());
+
+  it("expires a result after both players disconnected before completion, without any later activity", () => {
+    const players = [guest(), guest()];
+    const first = connect(players[0]);
+    const second = connect(players[1]);
+    pair(first, second);
+    first.close();
+    second.close();
+    vi.advanceTimersByTime(29_999);
+    expect(hub.stats()).toMatchObject({ placingMatches: 1, finishedMatches: 0 });
+    expect(database.getProfile(players[0].profile.userId)?.stats.gamesPlayed).toBe(0);
+    vi.advanceTimersByTime(1);
+    expect(hub.stats()).toMatchObject({ activeConnections: 0, finishedMatches: 1 });
+    expect(vi.getTimerCount()).toBe(1);
+    const profiles = players.map((player) => database.getProfile(player.profile.userId));
+    expect(profiles.map((profile) => profile?.stats.gamesPlayed)).toEqual([1, 1]);
+    vi.advanceTimersByTime(retention - 1);
+    expect(hub.stats().finishedMatches).toBe(1);
+    vi.advanceTimersByTime(1);
+    expect(hub.stats().matches).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(players.map((player) => database.getProfile(player.profile.userId))).toEqual(profiles);
+  });
+
+  it("keeps a one-sided timeout result retrievable until its original deadline", () => {
+    const player = guest();
+    const other = guest();
+    const first = connect(player);
+    const opponent = connect(other);
+    const id = pair(first, opponent);
+    first.close();
+    vi.advanceTimersByTime(30_000);
+    const profiles = [player, other].map((entry) => database.getProfile(entry.profile.userId));
+    vi.advanceTimersByTime(retention - 1);
+    const current = connect(player);
+    expect(view(current)).toMatchObject({ matchId: id, phase: "finished", result: { reason: "forfeit", won: false } });
+    current.close();
+    expect(hub.stats().finishedMatches).toBe(1);
+    vi.advanceTimersByTime(1);
+    expect(hub.stats().finishedMatches).toBe(0);
+    expect(connect(player).sent.some((message) => message.type === "match_finished")).toBe(false);
+    expect([player, other].map((entry) => database.getProfile(entry.profile.userId))).toEqual(profiles);
+  });
+
+  it("does not treat disconnects after completion as result acknowledgements", () => {
+    const players = [guest(), guest()];
+    const first = connect(players[0]);
+    const second = connect(players[1]);
+    const id = pair(first, second);
+    first.message({ type: "leave_match" });
+    first.close();
+    second.close();
+    expect(hub.stats()).toMatchObject({ activeConnections: 0, finishedMatches: 1 });
+    const current = connect(players[0]);
+    expect(view(current)).toMatchObject({ matchId: id, phase: "finished" });
+    current.close();
+    vi.advanceTimersByTime(retention);
+    expect(hub.stats().matches).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["forfeit", "ships_sunk"])("expires a regular %s result from completion, preserving XP and statistics", (reason) => {
+    const players = [guest(), guest()];
+    const first = connect(players[0]);
+    const second = connect(players[1]);
+    pair(first, second);
+    vi.advanceTimersByTime(5000);
+    if (reason === "forfeit") first.message({ type: "leave_match" });
+    else {
+      first.message({ type: "place_ships", placements: fleet });
+      second.message({ type: "place_ships", placements: fleet });
+      const validation = validateFleet(fleet);
+      if (!validation.valid) throw new Error(validation.error);
+      const cells = validation.ships.flatMap((ship) => ship.cells);
+      const shots = new Map([[first, 0], [second, 0]]);
+      for (let turn = 0; turn < cells.length * 2 - 1; turn += 1) {
+        const shooter = view(first).currentTurnUserId === players[0].profile.userId ? first : second;
+        const index = shots.get(shooter)!;
+        shooter.message({ type: "fire", ...cells[index] });
+        shots.set(shooter, index + 1);
+      }
+    }
+    expect(view(first)).toMatchObject({ phase: "finished", result: { reason } });
+    const profiles = players.map((player) => database.getProfile(player.profile.userId));
+    expect(profiles.every((profile) => profile!.xp > 0 && profile!.stats.gamesPlayed === 1)).toBe(true);
+    vi.advanceTimersByTime(retention - 1);
+    expect(hub.stats().finishedMatches).toBe(1);
+    const before = first.sent.length;
+    vi.advanceTimersByTime(1);
+    expect(hub.stats().matches).toBe(0);
+    expect(first.sent).toHaveLength(before);
+    expect(players.map((player) => database.getProfile(player.profile.userId))).toEqual(profiles);
+    expect(vi.getTimerCount()).toBe(2); // Only the two session expiry timers remain.
+  });
+
+  it("clears the retention timer after explicit acknowledgements without touching a newer match", () => {
+    const player = guest();
+    const first = connect(player);
+    const second = connect(guest());
+    pair(first, second);
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    first.message({ type: "leave_match" });
+    expect(vi.getTimerCount()).toBe(3);
+    const expired = timers.mock.calls.find((call) => call[1] === retention)![0] as () => void;
+    first.message({ type: "leave_match" });
+    first.message({ type: "leave_match" });
+    expect(hub.stats().finishedMatches).toBe(1);
+    const newerOpponent = connect(guest());
+    const id = pair(first, newerOpponent);
+    second.message({ type: "leave_match" });
+    expect(hub.stats()).toMatchObject({ finishedMatches: 0, placingMatches: 1 });
+    expect(vi.getTimerCount()).toBe(3); // Only the three connected sessions remain.
+    expired(); // Simulate a cancelled callback already queued by the event loop.
+    first.message({ type: "place_ships", placements: fleet });
+    expect(view(newerOpponent)).toMatchObject({ matchId: id, phase: "placing", opponent: { ready: true } });
+    expect(database.getProfile(player.profile.userId)?.stats.gamesPlayed).toBe(1);
+  });
+
+  it("expires multiple older results independently while the same account plays a newer match", () => {
+    const player = guest();
+    let first = connect(player);
+    const oldOpponent = connect(guest());
+    pair(first, oldOpponent);
+    first.message({ type: "leave_match" });
+    vi.advanceTimersByTime(1000);
+    const secondOpponent = connect(guest());
+    pair(first, secondOpponent);
+    first.message({ type: "leave_match" });
+    vi.advanceTimersByTime(1000);
+    const opponent = connect(guest());
+    const id = pair(first, opponent);
+    first.message({ type: "place_ships", placements: fleet });
+    opponent.message({ type: "place_ships", placements: fleet });
+    first.close();
+    first = connect(player);
+    expect(view(first)).toMatchObject({ matchId: id, phase: "playing" });
+    expect(first.sent.some((message) => message.type === "match_finished")).toBe(false);
+    const profile = database.getProfile(player.profile.userId);
+    vi.advanceTimersByTime(retention - 2000);
+    expect(hub.stats()).toMatchObject({ playingMatches: 1, finishedMatches: 1 });
+    vi.advanceTimersByTime(1000);
+    expect(hub.stats()).toMatchObject({ playingMatches: 1, finishedMatches: 0, matches: 1 });
+    const shooter = view(first).currentTurnUserId === player.profile.userId ? first : opponent;
+    shooter.message({ type: "fire", x: 0, y: 0 });
+    expect(view(shooter).enemyBoard.find((cell) => cell.x === 0 && cell.y === 0)?.state).toBe("hit");
+    expect(view(first).matchId).toBe(id);
+    expect(database.getProfile(player.profile.userId)).toEqual(profile);
+    expect(first.sent.some((message) => message.type === "error")).toBe(false);
+  });
+
+  it("replays the latest unacknowledged result and keeps older results independently available", () => {
+    const player = guest();
+    const first = connect(player);
+    const other = connect(guest());
+    const oldId = pair(first, other);
+    first.message({ type: "leave_match" });
+    vi.advanceTimersByTime(1000);
+    const newId = pair(first, other);
+    first.message({ type: "leave_match" });
+    first.close();
+    const current = connect(player);
+    expect(view(current).matchId).toBe(newId);
+    current.message({ type: "leave_match" });
+    current.close();
+    expect(view(connect(player)).matchId).toBe(oldId);
+    vi.advanceTimersByTime(retention - 1000);
+    expect(hub.stats().finishedMatches).toBe(1);
+    vi.advanceTimersByTime(1000);
+    expect(hub.stats().finishedMatches).toBe(0);
+    expect(database.getProfile(player.profile.userId)?.stats.gamesPlayed).toBe(2);
+  });
+
+  it.each([[4009, "Admin reset"], [1012, "Server restarting"]] as const)("clears results, timers and references on reset/shutdown (%s)", (code, reason) => {
+    const player = guest();
+    const other = guest();
+    const first = connect(player);
+    const second = connect(other);
+    pair(first, second);
+    first.message({ type: "leave_match" });
+    const profile = database.getProfile(player.profile.userId);
+    pair(first, second);
+    first.close();
+    expect(vi.getTimerCount()).toBe(3); // Retention, reconnect grace, second session.
+    expect(hub.resetRuntime(code, reason)).toMatchObject({ activeConnections: 0, matches: 0 });
+    expect(vi.getTimerCount()).toBe(0);
+    expect(second.closes).toContainEqual({ code, reason });
+    const current = connect(player);
+    const opponent = connect(other);
+    const id = pair(current, opponent);
+    vi.advanceTimersByTime(retention + 30_000);
+    expect(view(current)).toMatchObject({ matchId: id, phase: "placing" });
+    expect(hub.stats()).toMatchObject({ placingMatches: 1, finishedMatches: 0 });
+    expect(database.getProfile(player.profile.userId)).toEqual(profile);
+  });
+
+  it("does not replay an expired result when the event loop has delayed its timer", () => {
+    const player = guest();
+    const first = connect(player);
+    const second = connect(guest());
+    pair(first, second);
+    first.message({ type: "leave_match" });
+    vi.setSystemTime(Date.now() + retention);
+    const current = connect(player);
+    expect(current.sent.some((message) => message.type === "match_finished")).toBe(false);
+    expect(hub.stats().finishedMatches).toBe(0);
+    expect(vi.getTimerCount()).toBe(2);
+  });
+
+  it.each(["0", "-1", "1.5", "100ms", "NaN", "Infinity", "600001", "9007199254740992", " "])("rejects invalid retention configuration %j", (value) => {
+    vi.stubEnv("FINISHED_MATCH_RETENTION_MS", value);
+    expect(() => new GameHub()).toThrow(/FINISHED_MATCH_RETENTION_MS/);
+  });
+
+  it.each(["1", "1000", "600000"])("uses a validated retention of %s milliseconds from completion", (value) => {
+    hub.resetRuntime();
+    vi.stubEnv("FINISHED_MATCH_RETENTION_MS", value);
+    hub = new GameHub();
+    const first = connect(guest());
+    const second = connect(guest());
+    pair(first, second);
+    vi.advanceTimersByTime(5000);
+    expect(hub.stats().placingMatches).toBe(1);
+    first.message({ type: "leave_match" });
+    vi.advanceTimersByTime(Number(value) - 1);
+    expect(hub.stats().finishedMatches).toBe(1);
+    vi.advanceTimersByTime(1);
+    expect(hub.stats().matches).toBe(0);
   });
 });

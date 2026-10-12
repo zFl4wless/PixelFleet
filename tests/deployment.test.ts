@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { request } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
@@ -8,7 +9,7 @@ import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
-import type { ServerMessage } from "@pixelfleet/shared";
+import { WS_PROTOCOL, type ServerMessage } from "@pixelfleet/shared";
 
 let directory: string;
 const children: ChildProcess[] = [];
@@ -70,7 +71,20 @@ function launch(overrides: Record<string, string> = {}, entrypoint = "apps/backe
     child.on("error", reject);
     child.on("exit", (code) => reject(new Error(`Server exited with ${code}: ${output}`)));
   });
-  return { child, ready };
+  return { child, ready, output: () => output };
+}
+
+// Deliberately bypass ws's sender validation to exercise the server's receiver.
+function writeFrame(socket: WebSocket, frame: Buffer) {
+  (socket as unknown as { _socket: import("node:net").Socket })._socket.write(frame);
+}
+
+function oversizedFrameHeader(length: number, opcode = 0x81): Buffer {
+  const header = Buffer.alloc(8);
+  header[0] = opcode;
+  header[1] = 0xfe; // Masked frame with a 16-bit payload length.
+  header.writeUInt16BE(length, 2);
+  return header;
 }
 
 async function stop(child: ChildProcess) {
@@ -94,7 +108,7 @@ async function loginGuest(url: string, username = "Cookie test guest") {
 }
 
 async function openSessionSocket(url: string, cookie: string, origin = url, headers: Record<string, string> = {}) {
-  const socket = new WebSocket(`${url.replace("http:", "ws:")}/ws`, {
+  const socket = new WebSocket(`${url.replace("http:", "ws:")}/ws`, WS_PROTOCOL, {
     headers: { ...headers, Cookie: cookie, Origin: origin },
     handshakeTimeout: 2_000
   });
@@ -103,12 +117,12 @@ async function openSessionSocket(url: string, cookie: string, origin = url, head
   // Observe both promises immediately if the handshake unexpectedly fails.
   const [, [data]] = await Promise.all([once(socket, "open"), firstMessage]);
   const message = JSON.parse(data.toString());
-  expect(message.type).toBe("profile");
-  return { socket, profile: message.profile };
+  expect(message.type).toBe("session_snapshot");
+  return { socket, profile: message.profile, snapshot: message };
 }
 
 async function rejectedUpgrade(url: string, cookie?: string, origin = url, headers: Record<string, string> = {}): Promise<number> {
-  const socket = new WebSocket(`${url.replace("http:", "ws:")}/ws`, {
+  const socket = new WebSocket(`${url.replace("http:", "ws:")}/ws`, WS_PROTOCOL, {
     headers: { ...headers, Origin: origin, ...(cookie === undefined ? {} : { Cookie: cookie }) },
     handshakeTimeout: 2_000
   });
@@ -150,6 +164,565 @@ async function rejectedUpgrade(url: string, cookie?: string, origin = url, heade
 }
 
 describe("production deployment", () => {
+  it("asks legacy clients to reload and releases their transport slot before accepting the snapshot protocol (TD-06)", async () => {
+    const { child, ready } = launch({ MAX_WS_PER_IP: "1" }); const url = await ready;
+    const player = await loginGuest(url);
+    const legacy = new WebSocket(`${url.replace("http:", "ws:")}/ws`, { headers: { Cookie: player.cookie, Origin: url } });
+    sockets.push(legacy);
+    const first = once(legacy, "message"); const closed = once(legacy, "close");
+    expect(JSON.parse((await first)[0].toString())).toMatchObject({ type: "toast", message: expect.stringContaining("Reload this page") });
+    expect((await closed)[0]).toBe(4002);
+    expect((await (await fetch(`${url}/api/health`)).json()).hub.activeConnections).toBe(0);
+    const current = await openSessionSocket(url, player.cookie);
+    expect(current.socket.protocol).toBe(WS_PROTOCOL);
+    expect(current.snapshot).toMatchObject({ type: "session_snapshot", profile: player.profile, state: { kind: "lobby" } });
+    await stop(child);
+  }, 15_000);
+
+  it("contains preparation, async static and post-header failures without duplicate responses (TD-07)", async () => {
+    const entrypoint = join(directory, "http-faults.mjs");
+    const serverUrl = pathToFileURL(join(process.cwd(), "apps/backend/src/server.ts")).href;
+    await writeFile(join(directory, "frontend/assets/open-failure.js"), "fixture");
+    await writeFile(join(directory, "frontend/assets/read-failure.js"), "fixture");
+    await writeFile(entrypoint, `
+      import { createRequire, syncBuiltinESMExports } from 'node:module';
+      import { ServerResponse, IncomingMessage } from 'node:http';
+      import { Readable } from 'node:stream';
+      const require = createRequire(import.meta.url);
+      const fs = require('node:fs/promises');
+      const stat = fs.stat, open = fs.open;
+      const secret = 'secret-internal-message /private/secret-file SELECT private_sql';
+      fs.stat = async function(path, ...args) {
+        if (String(path).endsWith('syntax-failure.js')) throw new SyntaxError(secret);
+        if (String(path).endsWith('unknown-failure.js')) throw { secret };
+        return stat.call(this, path, ...args);
+      };
+      fs.open = async function(path, ...args) {
+        if (String(path).endsWith('open-failure.js')) throw Object.assign(new Error(secret), { code: 'EACCES' });
+        const handle = await open.call(this, path, ...args);
+        if (String(path).endsWith('read-failure.js')) handle.createReadStream = () => new Readable({ read() {
+          if (this.sent) return; this.sent = true; this.push('partial response');
+          setImmediate(() => this.destroy(new Error(secret)));
+        } });
+        return handle;
+      };
+      syncBuiltinESMExports();
+      let lateWrites = 0;
+      for (const method of ['setHeader', 'writeHead', 'end']) {
+        const original = ServerResponse.prototype[method];
+        ServerResponse.prototype[method] = function(...args) {
+          if (this.destroyed || this.writableEnded || (method !== 'end' && this.headersSent)) lateWrites++;
+          if (method === 'setHeader' && args[0] === 'Content-Security-Policy' && this.req.url.startsWith('/prep-failure')) throw new TypeError(secret);
+          return original.apply(this, args);
+        };
+      }
+      const emit = IncomingMessage.prototype.emit;
+      IncomingMessage.prototype.emit = function(event, ...args) {
+        if (event === 'data' && this.url === '/api/guest-login?abort-fixture') process.send({ bodyStarted: true });
+        return emit.call(this, event, ...args);
+      };
+      process.on('message', () => process.send({ lateWrites }));
+      await import(${JSON.stringify(serverUrl)});
+    `);
+    const { child, ready, output } = launch({}, entrypoint, true);
+    const url = await ready;
+    const ids: string[] = [];
+    for (const path of ["/prep-failure?secret-query=x", "/assets/syntax-failure.js", "/assets/unknown-failure.js", "/assets/open-failure.js"]) {
+      const response = await fetch(`${url}${path}`, { headers: { Cookie: "secret-cookie", Authorization: "Bearer secret-authorization", "X-Admin-Token": "secret-admin" } });
+      expect(response.status).toBe(500);
+      const body = await response.json();
+      expect(body).toEqual({ error: "Internal server error.", requestId: response.headers.get("x-request-id") });
+      ids.push(body.requestId);
+    }
+    // Once headers/body have started, close the stream rather than writing a JSON 500.
+    const partial = await new Promise<{ status: number; text: string }>((resolve, reject) => {
+      const req = request(`${url}/assets/read-failure.js`, (res) => {
+        let text = ""; res.setEncoding("utf8"); res.on("data", (chunk) => { text += chunk; });
+        res.once("aborted", () => resolve({ status: res.statusCode!, text }));
+        res.once("end", () => reject(new Error("Faulty read unexpectedly completed")));
+        res.on("error", () => {});
+      });
+      req.on("error", reject); req.end();
+    });
+    expect(partial).toEqual({ status: 200, text: "partial response" });
+    // A client disconnect during async input must not create an account or write later.
+    const started = once(child, "message");
+    const aborted = request(`${url}/api/guest-login?abort-fixture`, { method: "POST", headers: { "Content-Type": "application/json", Origin: url } });
+    aborted.on("error", () => {}); aborted.write('{"username":"secret-aborted-body');
+    expect((await started)[0]).toEqual({ bodyStarted: true }); aborted.destroy();
+    expect((await fetch(`${url}/api/health`)).status).toBe(200);
+    const snapshot = await (await fetch(`${url}/api/admin/metrics`, { headers: { Authorization: "Bearer deployment-test-token" } })).json();
+    expect(snapshot.counters).toMatchObject({ http_errors_total: 4, http_client_errors_total: 0, http_server_errors_total: 4, guest_accounts_created_total: 0 });
+    for (const [index, kind] of ["type", "syntax", "unknown", "error"].entries()) {
+      expect(snapshot.recentEvents.find((event: { requestId: string }) => event.requestId === ids[index])).toMatchObject({
+        type: "error", stage: index === 0 ? "preparation" : "static", diagnostic: { kind }
+      });
+    }
+    expect(snapshot.recentEvents.some((event: { responseState: string }) => event.responseState === "closed")).toBe(true);
+    expect(snapshot.recentEvents).toHaveLength(6);
+    const serialized = JSON.stringify(snapshot.recentEvents) + output();
+    for (const secret of ["secret-internal-message", "/private/secret-file", "private_sql", "secret-query", "secret-cookie", "secret-authorization", "secret-admin", "secret-aborted-body", directory]) expect(serialized).not.toContain(secret);
+    const observed = once(child, "message"); child.send("snapshot");
+    expect((await observed)[0]).toEqual({ lateWrites: 0 });
+    await loginGuest(url, "Recovered process");
+    await stop(child);
+  }, 15_000);
+
+  it("validates JSON structure, field types, media type and exact/chunked body limits without input leaks (TD-07)", async () => {
+    const { child, ready } = launch({ GUEST_LOGINS_PER_HOUR: "100" });
+    const url = await ready;
+    const responses: string[] = [];
+    let errors = 0;
+    async function invalid(body: string | Buffer, status: number, extra: Record<string, string> = {}, path = "/api/guest-login") {
+      const response = await fetch(`${url}${path}`, { method: "POST", headers: { Origin: url, "Content-Type": "application/json", ...extra }, body });
+      expect(response.status).toBe(status);
+      expect(response.headers.get("set-cookie")).toBeNull();
+      expect(response.headers.get("x-request-id")).toMatch(/^[0-9a-f-]{36}$/);
+      responses.push(await response.text());
+      errors++;
+    }
+    for (const body of [
+      '{"secret-body":', "", "null", "[]", '"secret-body"', "42", "true",
+      '{"username":null}', '{"username":42}', '{"username":[]}', '{"username":{}}', '{"username":true}',
+      '{}', '{"username":"a"}', '{"username":"admin"}'
+    ]) await invalid(body, 400);
+    for (const body of ["null", "[]", '"secret-reset-body"', '{"scope":null}', '{"scope":42}', '{"scope":[]}', '{"scope":{}}', '{"scope":"secret-reset-scope"}']) {
+      await invalid(body, 400, { Authorization: "Bearer deployment-test-token" }, "/api/admin/reset");
+    }
+    for (const type of ["text/plain", "application/jsonp", "text/application/json", "application/problem+json"]) {
+      await invalid('{"username":"secret-body"}', 415, { "Content-Type": type });
+    }
+    const missingType = await fetch(`${url}/api/guest-login`, { method: "POST", body: Buffer.from('{"username":"secret-body"}') });
+    expect(missingType.status).toBe(415); responses.push(await missingType.text()); errors++;
+    await invalid(JSON.stringify({ username: "Guest", padding: "secret-padding" + " ".repeat(16 * 1024) }), 413);
+    // No Content-Length: exceed the limit while streaming, retaining the socket for a 413.
+    const chunked = await new Promise<{ status: number; text: string }>((resolve, reject) => {
+      const req = request(`${url}/api/guest-login`, { method: "POST", headers: { "Content-Type": "application/json", "Transfer-Encoding": "chunked", Origin: url } }, (res) => {
+        let text = ""; res.setEncoding("utf8"); res.on("data", (chunk) => { text += chunk; });
+        res.on("end", () => resolve({ status: res.statusCode!, text }));
+      });
+      req.on("error", reject);
+      req.write(" ".repeat(16 * 1024)); req.end("x");
+    });
+    expect(chunked.status).toBe(413); responses.push(chunked.text); errors++;
+    const boundary = JSON.stringify({ username: "Boundary guest", padding: "" });
+    const valid = await fetch(`${url}/api/guest-login`, {
+      method: "POST", headers: { "Content-Type": "Application/JSON; charset=utf-8", Origin: url },
+      body: boundary + " ".repeat(16 * 1024 - Buffer.byteLength(boundary))
+    });
+    expect(valid.status).toBe(201); await valid.json();
+    expect(valid.headers.get("set-cookie")).toContain("HttpOnly");
+    const reset = await fetch(`${url}/api/admin/reset`, { method: "POST", headers: {
+      "Content-Type": "application/json", Authorization: "Bearer deployment-test-token", Origin: url
+    }, body: "{}" });
+    expect(reset.status).toBe(200); expect((await reset.json()).scope).toBe("runtime");
+    const metricsResponse = await fetch(`${url}/api/admin/metrics`, { headers: { Authorization: "Bearer deployment-test-token" } });
+    const snapshot = await metricsResponse.json();
+    expect(snapshot.counters).toMatchObject({ http_errors_total: errors, http_client_errors_total: errors, http_server_errors_total: 0 });
+    const text = JSON.stringify({ responses, events: snapshot.recentEvents });
+    for (const secret of ["secret-body", "secret-padding", "secret-reset-body", "secret-reset-scope", "deployment-test-token", directory]) expect(text).not.toContain(secret);
+    await stop(child);
+  }, 15_000);
+
+  it("preserves 401/403/404/429 and headers, generates IDs and counts every completed response once (TD-07)", async () => {
+    const { child, ready } = launch({ HTTP_REQUESTS_PER_MINUTE: "4" });
+    const url = await ready;
+    const ids = new Set<string>();
+    const cases: [string, RequestInit, number][] = [
+      ["/api/me", {}, 401],
+      ["/api/logout", { method: "POST", headers: { Origin: "https://secret-origin.example" } }, 403],
+      ["/api/missing?secret-query=x", {}, 404],
+      ["/api/me", { method: "OPTIONS", headers: { Origin: url } }, 204],
+      ["/api/health", {}, 200],
+      ["/", { headers: { Origin: url } }, 200],
+      ["/api/me", {}, 429]
+    ];
+    for (const [path, options, status] of cases) {
+      const response = await fetch(`${url}${path}`, { ...options, headers: { "X-Request-ID": "secret-client-id", ...options.headers } });
+      expect(response.status).toBe(status);
+      const id = response.headers.get("x-request-id")!;
+      expect(id).toMatch(/^[0-9a-f-]{36}$/); expect(ids.has(id)).toBe(false); ids.add(id);
+      expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(response.headers.get("set-cookie")).toBeNull();
+      if (status === 429) expect(Number(response.headers.get("retry-after"))).toBeGreaterThan(0);
+      if (status === 403) expect(response.headers.get("access-control-allow-origin")).toBeNull();
+      if (options.headers && "Origin" in options.headers && options.headers.Origin === url) {
+        expect(response.headers.get("access-control-allow-origin")).toBe(url);
+        expect(response.headers.get("access-control-allow-credentials")).toBe("true");
+        expect(response.headers.get("access-control-expose-headers")).toBe("X-Request-ID");
+      }
+      await response.text();
+    }
+    const headers = { Authorization: "Bearer deployment-test-token", "X-Forwarded-For": "198.51.100.77" };
+    const metricsResponse = await fetch(`${url}/api/admin/metrics`, { headers });
+    const snapshot = await metricsResponse.json();
+    expect(snapshot.counters).toMatchObject({ http_requests_total: cases.length, http_errors_total: 4, http_client_errors_total: 4, http_server_errors_total: 0, rate_limited_total: 1 });
+    expect(JSON.stringify(snapshot.recentEvents)).not.toMatch(/secret-origin|secret-query|secret-client-id|deployment-test-token/);
+    const prometheus = await (await fetch(`${url}/metrics`, { headers })).text();
+    expect(prometheus).toContain("pixelfleet_http_client_errors_total 4");
+    expect(prometheus).toContain("pixelfleet_http_server_errors_total 0");
+    expect(prometheus).not.toMatch(/\{|secret-|requestId/);
+    await stop(child);
+  }, 15_000);
+
+  it("isolates an HTTP storage failure with a correlated generic 500 and recovers after repair (TD-07)", async () => {
+    const { child, ready } = launch();
+    const url = await ready;
+    const player = await loginGuest(url, "HTTP failure dummy");
+    const fixture = new DatabaseSync(join(directory, "pixelfleet.sqlite"));
+    let response: Response;
+    let failure: unknown;
+    try {
+      fixture.exec("ALTER TABLE sessions RENAME TO hidden_session_fixture");
+      response = await fetch(`${url}/api/me?private=secret-query`, { headers: {
+        Cookie: `${player.cookie}; private=secret-cookie`, Authorization: "Bearer secret-authorization",
+        "X-Admin-Token": "secret-admin-header", "X-Request-ID": "secret-client-request-id"
+      } });
+      failure = await response.json();
+      expect((await fetch(`${url}/api/health`)).status).toBe(200);
+    } finally {
+      fixture.exec("ALTER TABLE hidden_session_fixture RENAME TO sessions");
+      fixture.close();
+    }
+    const repaired = await fetch(`${url}/api/me`, { headers: { Cookie: player.cookie } });
+    expect(repaired.status).toBe(200);
+    expect((await repaired.json()).profile.userId).toBe(player.profile.userId);
+    expect({ status: response!.status, body: failure }).toMatchObject({ status: 500, body: { error: "Internal server error." } });
+    const id = response!.headers.get("x-request-id");
+    expect(id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(failure).toEqual({ error: "Internal server error.", requestId: id });
+    const admin = await fetch(`${url}/api/admin/metrics`, { headers: { Authorization: "Bearer deployment-test-token" } });
+    const diagnostics = await admin.json();
+    expect(diagnostics.recentEvents).toContainEqual(expect.objectContaining({
+      type: "error", requestId: id, route: "me", diagnostic: expect.objectContaining({ kind: "database", code: "ERR_SQLITE_ERROR" })
+    }));
+    const text = JSON.stringify({ failure, diagnostics });
+    for (const secret of [player.cookie, "secret-query", "secret-cookie", "secret-authorization", "secret-admin-header", "secret-client-request-id", "hidden_session_fixture", directory, "no such table", "SELECT"]) {
+      expect(text).not.toContain(secret);
+    }
+    expect(diagnostics.counters).toMatchObject({ http_errors_total: 1, http_client_errors_total: 0, http_server_errors_total: 1 });
+    await stop(child);
+  }, 15_000);
+
+  it("returns a correlated generic 500 for a metrics gauge failure and recovers the Prometheus route (TD-07 review)", async () => {
+    const { child, ready } = launch();
+    const url = await ready;
+    const headers = { Authorization: "Bearer deployment-test-token", "X-Request-ID": "secret-client-metrics-id" };
+    const player = await loginGuest(url, "Metrics failure dummy");
+    const unauthorized = await fetch(`${url}/metrics`);
+    expect(unauthorized.status).toBe(401);
+    await unauthorized.text();
+
+    const fixture = new DatabaseSync(join(directory, "pixelfleet.sqlite"));
+    let renamed = false;
+    let requestId: string | null = null;
+    let failure: unknown;
+    try {
+      fixture.exec("ALTER TABLE users RENAME TO secret_metrics_user_fixture");
+      renamed = true;
+      // A socket abort must fail this test, rather than substitute for the HTTP 500.
+      const response = await fetch(`${url}/metrics`, { headers });
+      expect(response.status).toBe(500);
+      expect(response.headers.get("content-type")).toBe("application/json; charset=utf-8");
+      requestId = response.headers.get("x-request-id");
+      expect(requestId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(requestId).not.toBe(headers["X-Request-ID"]);
+      failure = await response.json();
+      expect(failure).toEqual({ error: "Internal server error.", requestId });
+      expect((await fetch(`${url}/api/health`)).status).toBe(200);
+    } finally {
+      try {
+        if (renamed) fixture.exec("ALTER TABLE secret_metrics_user_fixture RENAME TO users");
+      } finally { fixture.close(); }
+    }
+
+    const recovered = await fetch(`${url}/metrics`, { headers });
+    expect(recovered.status).toBe(200);
+    expect(recovered.headers.get("content-type")).toBe("text/plain; version=0.0.4; charset=utf-8");
+    const prometheus = await recovered.text();
+    expect(prometheus).toContain("# TYPE pixelfleet_users gauge\npixelfleet_users 1\n");
+    expect(prometheus).toContain("# TYPE pixelfleet_sessions gauge\npixelfleet_sessions 1\n");
+    expect(prometheus).toContain("pixelfleet_http_server_errors_total 1\n");
+    const me = await fetch(`${url}/api/me`, { headers: { Cookie: player.cookie } });
+    expect(me.status).toBe(200);
+    expect((await me.json()).profile.userId).toBe(player.profile.userId);
+
+    const admin = await fetch(`${url}/api/admin/metrics`, { headers });
+    expect(admin.status).toBe(200);
+    const diagnostics = await admin.json();
+    expect(diagnostics.recentEvents).toEqual([expect.objectContaining({
+      type: "error", requestId, method: "GET", route: "metrics", stage: "handler", responseState: "unstarted",
+      diagnostic: expect.objectContaining({ kind: "database", code: "ERR_SQLITE_ERROR" })
+    })]);
+    expect(diagnostics.counters).toMatchObject({ http_errors_total: 2, http_client_errors_total: 1, http_server_errors_total: 1 });
+    const text = JSON.stringify({ failure, events: diagnostics.recentEvents }) + prometheus;
+    for (const secret of ["deployment-test-token", "secret-client-metrics-id", "secret_metrics_user_fixture", directory, "no such table", "SELECT"]) {
+      expect(text).not.toContain(secret);
+    }
+    await stop(child);
+  }, 15_000);
+
+  it.each(["stats", "accounts"])("cancels pending rewards and retained results on an administrative %s reset (TD-05)", async (scope) => {
+    const entrypoint = join(directory, "completion-clock.mjs");
+    const serverUrl = pathToFileURL(join(process.cwd(), "apps/backend/src/server.ts")).href;
+    await writeFile(entrypoint, `
+      import { mock } from "node:test";
+      mock.timers.enable({ apis: ["Date", "setTimeout", "setInterval"], now: 0 });
+      process.on("message", ({ tick }) => { mock.timers.tick(tick); process.send("ticked"); });
+      await import(${JSON.stringify(serverUrl)});
+    `);
+    const { child, ready } = launch({}, entrypoint, true);
+    const url = await ready;
+    let players = [await loginGuest(url, "Reset first dummy"), await loginGuest(url, "Reset second dummy")];
+    let clients = await Promise.all(players.map((p) => openSessionSocket(url, p.cookie)));
+    const received: ServerMessage[] = [];
+    clients[0].socket.on("message", (data) => received.push(JSON.parse(data.toString())));
+    const pairing = async () => {
+      received.length = 0;
+      for (const c of clients) c.socket.send(JSON.stringify({ type: "join_queue" }));
+      await expect.poll(() => received.some((m) => m.type === "match_found")).toBe(true);
+    };
+    await pairing();
+    clients[0].socket.send(JSON.stringify({ type: "leave_match" }));
+    await expect.poll(() => received.some((m) => m.type === "match_finished")).toBe(true);
+    const fixture = new DatabaseSync(join(directory, "pixelfleet.sqlite"));
+    try {
+      const receipts = () => fixture.prepare("SELECT COUNT(*) AS count FROM match_completions").get()!.count;
+      expect(receipts()).toBe(1);
+      const saved = fixture.prepare("SELECT match_id, decision_json FROM match_completions").get()!;
+      fixture.exec(`CREATE TRIGGER fail_second_completion BEFORE UPDATE OF games_played ON users
+        WHEN (SELECT SUM(games_played) FROM users) > 2
+        BEGIN SELECT RAISE(ABORT, 'injected reset fixture failure'); END;`);
+      await pairing();
+      clients[0].socket.send(JSON.stringify({ type: "leave_match" }));
+      await expect.poll(() => received.some((m) => m.type === "game_update" && m.view.phase === "saving")).toBe(true);
+      const closed = clients.map((c) => once(c.socket, "close"));
+      const reset = await fetch(`${url}/api/admin/reset`, {
+        method: "POST", headers: { Authorization: "Bearer deployment-test-token", Origin: url, "Content-Type": "application/json" },
+        body: JSON.stringify({ scope })
+      });
+      expect(reset.status).toBe(200);
+      expect((await reset.json()).hub).toMatchObject({ matches: 0, activeConnections: 0, finishedMatches: 0 });
+      expect((await Promise.all(closed)).map((r) => r[0])).toEqual([4009, 4009]);
+      expect(receipts()).toBe(1);
+      expect(fixture.prepare("SELECT match_id, decision_json FROM match_completions").get()).toEqual(saved);
+      fixture.exec("DROP TRIGGER fail_second_completion");
+      if (scope === "accounts") players = [await loginGuest(url, "New first dummy"), await loginGuest(url, "New second dummy")];
+      clients = await Promise.all(players.map((p) => openSessionSocket(url, p.cookie)));
+      clients[0].socket.on("message", (data) => received.push(JSON.parse(data.toString())));
+      await pairing();
+      const advanced = once(child, "message");
+      child.send!({ tick: 5000 });
+      await advanced;
+      expect(receipts()).toBe(1);
+      expect(fixture.prepare("SELECT SUM(games_played) AS games, SUM(xp) AS xp FROM users").get()).toMatchObject({ games: 0, xp: 0 });
+      const health = await fetch(`${url}/api/health`);
+      expect((await health.json()).hub).toMatchObject({ placingMatches: 1, finishedMatches: 0 });
+      clients[0].socket.send(JSON.stringify({ type: "leave_match" }));
+      await expect.poll(() => received.some((m) => m.type === "match_finished")).toBe(true);
+      expect(receipts()).toBe(2);
+      expect(fixture.prepare("SELECT SUM(games_played) AS games FROM users").get()!.games).toBe(2);
+      const ended = clients.map((c) => once(c.socket, "close"));
+      await stop(child);
+      await Promise.all(ended);
+    } finally { fixture.close(); }
+  }, 15_000);
+
+  it("periodically prunes all HTTP and hub quotas without requests and keeps cleanup after admin reset (TD-04)", async () => {
+    // Observe private bucket sizes only in this disposable process; no production diagnostics hook.
+    const entrypoint = join(directory, "quota-clock.mjs");
+    const limiterUrl = pathToFileURL(join(process.cwd(), "apps/backend/src/rate-limit.ts")).href;
+    const serverUrl = pathToFileURL(join(process.cwd(), "apps/backend/src/server.ts")).href;
+    await writeFile(entrypoint, `
+      import { mock } from "node:test";
+      mock.timers.enable({ apis: ["Date", "setInterval"], now: 0 });
+      const intervals = new Set();
+      const setInterval = globalThis.setInterval;
+      const clearInterval = globalThis.clearInterval;
+      globalThis.setInterval = (...args) => {
+        const timer = setInterval(...args); intervals.add(timer); return timer;
+      };
+      globalThis.clearInterval = (timer) => { intervals.delete(timer); clearInterval(timer); };
+      process.on("exit", () => console.log("Remaining intervals: " + intervals.size));
+      const { FixedWindowRateLimiter } = await import(${JSON.stringify(limiterUrl)});
+      const observed = new Set();
+      const original = FixedWindowRateLimiter.prototype.check;
+      FixedWindowRateLimiter.prototype.check = function (...args) {
+        observed.add(this);
+        return original.apply(this, args);
+      };
+      process.on("message", ({ tick = 0, seed = false }) => {
+        mock.timers.tick(tick);
+        if (seed) for (const limiter of observed) {
+          for (let i = 0; i < 1000; i++) limiter.check("synthetic-" + Date.now() + "-" + i);
+        }
+        process.send({ intervals: intervals.size, entries: [...observed].map(limiter => ({
+          limit: limiter.options.limit, windowMs: limiter.options.windowMs,
+          size: limiter.buckets.size, now: Date.now()
+        })) });
+      });
+      await import(${JSON.stringify(serverUrl)});
+    `);
+    const { child, ready, output } = launch({}, entrypoint, true);
+    const url = await ready;
+    const login = await loginGuest(url, "Quota lifecycle dummy");
+    expect((await fetch(`${url}/api/admin/status`, { headers: { Authorization: "Bearer deployment-test-token" } })).status).toBe(200);
+    const { socket } = await openSessionSocket(url, login.cookie);
+    const reply = once(socket, "message");
+    socket.send(JSON.stringify({ type: "cancel_queue" }));
+    await reply;
+    const invalid = once(socket, "message");
+    socket.send(JSON.stringify({ type: "fire", x: 0, y: 0 }));
+    await invalid;
+    const closed = once(socket, "close");
+    socket.close(); await closed;
+    type Inventory = { limit: number; windowMs: number; size: number; now: number }[];
+    async function clock(tick = 0, seed = false): Promise<Inventory> {
+      const acknowledged = once(child, "message");
+      child.send!({ tick, seed });
+      const snapshot = (await acknowledged)[0] as { intervals: number; entries: Inventory };
+      expect(snapshot.intervals).toBe(2); // Heartbeat and exactly one quota cleanup, also after reset.
+      return snapshot.entries;
+    }
+    const initial = await clock(0, true);
+    expect(initial.filter((entry) => entry.limit !== 7).map((entry) => [entry.limit, entry.windowMs]).sort()).toEqual([
+      [240, 60_000], [12, 3_600_000], [60, 60_000], [30, 60_000],
+      [120, 10_000], [12, 60_000], [120, 10_000]
+    ].sort());
+    expect(initial.every((entry) => entry.size >= 1000)).toBe(true);
+    const halfway = await clock(30_000);
+    expect(halfway.filter((entry) => entry.windowMs === 10_000).every((entry) => entry.size === 0)).toBe(true);
+    expect(halfway.filter((entry) => entry.windowMs >= 60_000).every((entry) => entry.size >= 1000)).toBe(true);
+    expect(halfway.find((entry) => entry.limit === 7)).toBeDefined();
+    await clock(0, true); // Fresh keys must not be evicted at the older keys' boundary.
+    const minute = await clock(30_000);
+    expect(minute.filter((entry) => entry.windowMs === 10_000).every((entry) => entry.size === 0)).toBe(true);
+    expect(minute.filter((entry) => entry.windowMs === 60_000).every((entry) => entry.size === 1000)).toBe(true);
+    expect(minute.find((entry) => entry.windowMs === 3_600_000)!.size).toBeGreaterThanOrEqual(2000);
+    const hour = await clock(3_570_000);
+    expect(hour.every((entry) => entry.size === 0)).toBe(true);
+    const reset = await fetch(`${url}/api/admin/reset`, {
+      method: "POST", headers: { Authorization: "Bearer deployment-test-token", Origin: url, "Content-Type": "application/json" },
+      body: JSON.stringify({ scope: "runtime" })
+    });
+    expect(reset.status).toBe(200); await reset.json();
+    const current = await openSessionSocket(url, login.cookie);
+    const errored = once(current.socket, "message");
+    current.socket.send("not-json"); await errored;
+    const ended = once(current.socket, "close");
+    current.socket.close(); await ended;
+    const next = await clock(60_000);
+    expect(next.every((entry) => entry.size === 0)).toBe(true);
+    await stop(child);
+    expect(output()).toContain("Remaining intervals: 0");
+  }, 15_000);
+
+  it.each([
+    { name: "invalid UTF-8", limit: undefined, send: (socket: WebSocket) => socket.send(Buffer.from([0xff]), { binary: false }) },
+    { name: "reserved opcode", limit: undefined, send: (socket: WebSocket) => writeFrame(socket, Buffer.from([0x83, 0x80, 0, 0, 0, 0])) },
+    { name: "oversized default payload", limit: undefined, send: (socket: WebSocket) => writeFrame(socket, oversizedFrameHeader(4097)) },
+    { name: "oversized configured payload", limit: "512", send: (socket: WebSocket) => writeFrame(socket, oversizedFrameHeader(513)) },
+    { name: "oversized fragmented payload", limit: "512", send: (socket: WebSocket) => {
+      socket.send(" ".repeat(256), { fin: false });
+      writeFrame(socket, oversizedFrameHeader(257, 0x80));
+    } }
+  ])("isolates $name while other clients keep playing and connection slots recover", async ({ limit, send }) => {
+    const { child, ready, output } = launch({ MAX_WS_PER_IP: "3", ...(limit ? { MAX_WS_PAYLOAD_BYTES: limit } : {}) });
+    const url = await ready;
+    const first = await loginGuest(url, "Valid first guest");
+    const second = await loginGuest(url, "Valid second guest");
+    const affected = await loginGuest(url, "Transport error guest");
+    const a = (await openSessionSocket(url, first.cookie)).socket;
+    const b = (await openSessionSocket(url, second.cookie)).socket;
+    const bad = (await openSessionSocket(url, affected.cookie)).socket;
+    const received: ServerMessage[][] = [[], []];
+    [a, b].forEach((socket, index) => socket.on("message", (data) => received[index].push(JSON.parse(data.toString()))));
+    const latestView = (index: number) => received[index].filter((message) => message.type === "game_update").at(-1)?.view;
+    a.send(JSON.stringify({ type: "join_queue" }));
+    b.send(JSON.stringify({ type: "join_queue" }));
+    await expect.poll(() => latestView(0)?.phase).toBe("placing");
+    const placements = [
+      { shipId: "battleship", x: 0, y: 0, orientation: "horizontal" },
+      { shipId: "cruiser", x: 0, y: 2, orientation: "horizontal" },
+      { shipId: "destroyer-a", x: 0, y: 4, orientation: "horizontal" },
+      { shipId: "destroyer-b", x: 0, y: 6, orientation: "horizontal" },
+      { shipId: "submarine", x: 0, y: 8, orientation: "horizontal" }
+    ];
+    for (const socket of [a, b]) socket.send(JSON.stringify({ type: "place_ships", placements }));
+    await expect.poll(() => latestView(0)?.phase).toBe("playing");
+
+    // A valid UTF-8 message exactly at the byte limit must still be accepted.
+    const action = JSON.stringify({ type: "join_queue", padding: "é" });
+    const boundaryMessage = action + " ".repeat(Number(limit ?? 4096) - Buffer.byteLength(action));
+    const queued = once(bad, "message");
+    bad.send(boundaryMessage);
+    expect(JSON.parse((await queued)[0].toString())).toMatchObject({ type: "queue_status", queued: true });
+    const closed = once(bad, "close", { signal: AbortSignal.timeout(2000) });
+    send(bad);
+    await closed;
+    expect(bad.readyState).toBe(WebSocket.CLOSED);
+    // A crash remains confined to this child; include its stderr in the failure.
+    const health = await fetch(`${url}/api/health`).catch((error) => {
+      throw new Error(`Backend failed after malformed frame: ${output()}`, { cause: error });
+    });
+    expect(health.status).toBe(200);
+    expect(child.exitCode, output()).toBeNull();
+    await expect.poll(async () => (await (await fetch(`${url}/api/health`)).json()).hub).toMatchObject({
+      activeConnections: 2, queuedPlayers: 0, playingMatches: 1
+    });
+    const turn = latestView(0)!.currentTurnUserId;
+    (turn === first.profile.userId ? a : b).send(JSON.stringify({ type: "fire", x: 0, y: 0 }));
+    await expect.poll(() => latestView(0)?.currentTurnUserId).not.toBe(turn);
+    await expect.poll(() => latestView(1)?.currentTurnUserId).not.toBe(turn);
+    expect([a.readyState, b.readyState]).toEqual([WebSocket.OPEN, WebSocket.OPEN]);
+    expect(received.flat().some((message) => message.type === "error")).toBe(false);
+
+    const recovered = await openSessionSocket(url, affected.cookie);
+    const cancelled = once(recovered.socket, "message");
+    recovered.socket.send(JSON.stringify({ type: "cancel_queue" }));
+    expect(JSON.parse((await cancelled)[0].toString())).toMatchObject({ type: "queue_status", queued: false });
+    expect(await rejectedUpgrade(url, first.cookie)).toBe(429);
+    await stop(child);
+  }, 15_000);
+
+  it("handles repeated socket errors before hub initialization without releasing another client's slot", async () => {
+    const entrypoint = join(directory, "early-socket-errors.mjs");
+    const hubUrl = pathToFileURL(join(process.cwd(), "apps/backend/src/game-hub.ts")).href;
+    const serverUrl = pathToFileURL(join(process.cwd(), "apps/backend/src/server.ts")).href;
+    await writeFile(entrypoint, `
+      const { GameHub } = await import(${JSON.stringify(hubUrl)});
+      const originalConnect = GameHub.prototype.connect;
+      let connections = 0;
+      GameHub.prototype.connect = function (ws, ...args) {
+        if (++connections !== 2) return originalConnect.call(this, ws, ...args);
+        queueMicrotask(() => {
+          ws.emit("error", new Error("First initialization transport failure"));
+          ws.emit("error", new Error("Repeated initialization transport failure"));
+        });
+      };
+      await import(${JSON.stringify(serverUrl)});
+    `);
+    const { child, ready } = launch({ MAX_WS_PER_IP: "2" }, entrypoint);
+    const url = await ready;
+    const first = await loginGuest(url, "Stable transport guest");
+    const second = await loginGuest(url, "Early error guest");
+    const stable = await openSessionSocket(url, first.cookie);
+    const failed = new WebSocket(`${url.replace("http:", "ws:")}/ws`, WS_PROTOCOL, {
+      headers: { Cookie: second.cookie, Origin: url }, handshakeTimeout: 2_000
+    });
+    sockets.push(failed);
+    failed.on("error", () => {});
+    await new Promise<void>((resolve) => failed.once("close", () => resolve()));
+    await expect.poll(async () => (await (await fetch(`${url}/api/health`)).json()).hub.activeConnections).toBe(1);
+    const recovered = await openSessionSocket(url, second.cookie);
+    expect(recovered.profile.userId).toBe(second.profile.userId);
+    expect(await rejectedUpgrade(url, first.cookie)).toBe(429);
+    const reply = once(stable.socket, "message");
+    stable.socket.send(JSON.stringify({ type: "cancel_queue" }));
+    expect(JSON.parse((await reply)[0].toString())).toMatchObject({ type: "queue_status", queued: false });
+    await stop(child);
+  }, 15_000);
+
   it("enforces an existing session's fixed deadline for HTTP and upgrades, expires an idle socket and retains account data", async () => {
     const start = Date.parse("2026-10-12T12:00:00.000Z");
     const yearMs = 365 * 24 * 60 * 60 * 1000;
@@ -343,7 +916,9 @@ describe("production deployment", () => {
     function waitView(socket: WebSocket, predicate: (message: Extract<ServerMessage, { type: "game_update" | "match_finished" }>) => boolean) {
       return new Promise<Extract<ServerMessage, { type: "game_update" | "match_finished" }>["view"]>((resolve, reject) => {
         const onMessage = (data: WebSocket.RawData) => {
-          const message = JSON.parse(data.toString()) as ServerMessage;
+          const received = JSON.parse(data.toString()) as ServerMessage;
+          const message = received.type === "session_snapshot" && received.state.kind === "match"
+            ? { type: "game_update" as const, view: received.state.view } : received;
           if ((message.type === "game_update" || message.type === "match_finished") && predicate(message)) {
             cleanup();
             resolve(message.view);
@@ -382,7 +957,7 @@ describe("production deployment", () => {
     first.close();
     expect(await disconnected).toMatchObject({ matchId: newView.matchId, opponent: { connected: false } });
     await closed;
-    const current = new WebSocket(`${url.replace("http:", "ws:")}/ws`, {
+    const current = new WebSocket(`${url.replace("http:", "ws:")}/ws`, WS_PROTOCOL, {
       headers: { Cookie: player.cookie, Origin: url }, handshakeTimeout: 2_000
     });
     sockets.push(current);
@@ -585,7 +1160,7 @@ describe("production deployment", () => {
     const first = await loginGuest(url, "First dummy guest");
     const second = await loginGuest(url, "Second dummy guest");
     const stable = await openSessionSocket(url, first.cookie);
-    const failed = new WebSocket(`${url.replace("http:", "ws:")}/ws`, {
+    const failed = new WebSocket(`${url.replace("http:", "ws:")}/ws`, WS_PROTOCOL, {
       headers: { Cookie: second.cookie, Origin: url }, handshakeTimeout: 2_000
     });
     sockets.push(failed);
@@ -689,7 +1264,7 @@ describe("production deployment", () => {
     expect(cookie).toContain("; Secure");
     const { profile } = await login.json();
 
-    const socket = new WebSocket(`${url.replace("http:", "ws:")}/ws`, {
+    const socket = new WebSocket(`${url.replace("http:", "ws:")}/ws`, WS_PROTOCOL, {
       headers: { Cookie: cookie.split(";")[0], Origin: url }
     });
     sockets.push(socket);
@@ -702,7 +1277,7 @@ describe("production deployment", () => {
     expect(opponentLogin.status).toBe(201);
     const opponentCookie = opponentLogin.headers.get("set-cookie")!.split(";")[0];
     await opponentLogin.json();
-    const opponent = new WebSocket(`${url.replace("http:", "ws:")}/ws`, {
+    const opponent = new WebSocket(`${url.replace("http:", "ws:")}/ws`, WS_PROTOCOL, {
       headers: { Cookie: opponentCookie, Origin: url }
     });
     sockets.push(opponent);
@@ -732,6 +1307,8 @@ describe("production deployment", () => {
     const persisted = (await me.json()).profile;
     expect(persisted.userId).toBe(profile.userId);
     expect(persisted.stats.gamesPlayed).toBe(0);
+    const resumed = await openSessionSocket(restartedUrl, cookie.split(";")[0]);
+    expect(resumed.snapshot).toEqual({ type: "session_snapshot", profile: persisted, state: { kind: "lobby" } });
     await stop(restarted.child);
   }, 15_000);
 

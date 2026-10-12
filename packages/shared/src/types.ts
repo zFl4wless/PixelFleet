@@ -76,7 +76,7 @@ export interface MatchPlayerPublic {
   ready: boolean;
 }
 
-export type MatchPhase = "placing" | "playing" | "finished";
+export type MatchPhase = "placing" | "playing" | "saving" | "save_failed" | "finished";
 
 export interface MatchResult {
   winnerId: UserId;
@@ -121,7 +121,22 @@ export type ClientMessage =
   | { type: "fire"; x: number; y: number }
   | { type: "leave_match" };
 
+// Change together with backend and frontend; older clients cannot reconcile snapshots.
+export const WS_PROTOCOL = "pixelfleet.v2";
+
+export type SessionState =
+  | { kind: "lobby" }
+  | { kind: "queue" }
+  | { kind: "match"; view: PublicMatchView };
+
+export interface SessionSnapshot {
+  profile: PlayerProfile;
+  // Match phase explicitly distinguishes placement, play, saving, failure and result.
+  state: SessionState;
+}
+
 export type ServerMessage =
+  | ({ type: "session_snapshot" } & SessionSnapshot)
   | { type: "profile"; profile: PlayerProfile }
   | { type: "queue_status"; queued: boolean; message: string }
   | { type: "match_found"; matchId: MatchId }

@@ -4,6 +4,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { sessionExpiresAt } from "./session-lifetime.js";
+import { inTransaction, migrateDatabase } from "./migrations.js";
+import { PublicInputError } from "./input-errors.js";
 import {
   calculateMatchXp,
   hitRate,
@@ -40,7 +42,7 @@ export interface DatabaseStats {
 
 export type ResetScope = "accounts" | "all" | "sessions" | "stats";
 
-export interface MatchStatsUpdate {
+interface MatchStatsUpdate {
   xpEarned: number;
   profile: PlayerProfile;
 }
@@ -48,32 +50,13 @@ export interface MatchStatsUpdate {
 mkdirSync(dirname(databasePath), { recursive: true });
 
 const db = new DatabaseSync(databasePath);
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  PRAGMA foreign_keys = ON;
-
-  CREATE TABLE IF NOT EXISTS users (
-    user_id TEXT PRIMARY KEY,
-    username TEXT NOT NULL,
-    avatar_seed TEXT NOT NULL,
-    xp INTEGER NOT NULL DEFAULT 0,
-    wins INTEGER NOT NULL DEFAULT 0,
-    losses INTEGER NOT NULL DEFAULT 0,
-    games_played INTEGER NOT NULL DEFAULT 0,
-    shots_fired INTEGER NOT NULL DEFAULT 0,
-    hits INTEGER NOT NULL DEFAULT 0,
-    ships_sunk INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS sessions (
-    token_hash TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    created_at TEXT NOT NULL,
-    last_seen_at TEXT NOT NULL
-  );
-`);
+try {
+  migrateDatabase(db);
+  db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+} catch (error) {
+  db.close();
+  throw error;
+}
 
 export function closeDatabase(): void {
   db.close();
@@ -135,14 +118,14 @@ export function sanitizeUsername(username: string): string {
 function assertAllowedUsername(username: string): void {
   const reservedNames = new Set(["admin", "moderator", "mod", "system", "server", "pixel fleet"]);
   if (reservedNames.has(username.toLowerCase())) {
-    throw new Error("This username is reserved.");
+    throw new PublicInputError("reserved_username");
   }
 }
 
 export function createGuestAccount(username: string): { profile: PlayerProfile; sessionToken: string; expiresAt: number } {
   const safeUsername = sanitizeUsername(username);
   if (safeUsername.length < 2) {
-    throw new Error("Username must be at least 2 characters.");
+    throw new PublicInputError("short_username");
   }
   assertAllowedUsername(safeUsername);
 
@@ -151,26 +134,28 @@ export function createGuestAccount(username: string): { profile: PlayerProfile; 
   const createdAt = now();
   const sessionToken = createSessionToken();
 
-  db.prepare(
-    `INSERT INTO users (
-      user_id, username, avatar_seed, xp, wins, losses, games_played,
-      shots_fired, hits, ships_sunk, created_at, updated_at
-    ) VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 0, ?, ?)`
-  ).run(userId, safeUsername, avatarSeed, createdAt, createdAt);
+  return inTransaction(db, () => {
+    db.prepare(
+      `INSERT INTO users (
+        user_id, username, avatar_seed, xp, wins, losses, games_played,
+        shots_fired, hits, ships_sunk, created_at, updated_at
+      ) VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 0, ?, ?)`
+    ).run(userId, safeUsername, avatarSeed, createdAt, createdAt);
 
-  db.prepare("INSERT INTO sessions (token_hash, user_id, created_at, last_seen_at) VALUES (?, ?, ?, ?)").run(
-    tokenHash(sessionToken),
-    userId,
-    createdAt,
-    createdAt
-  );
+    db.prepare("INSERT INTO sessions (token_hash, user_id, created_at, last_seen_at) VALUES (?, ?, ?, ?)").run(
+      tokenHash(sessionToken),
+      userId,
+      createdAt,
+      createdAt
+    );
 
-  const profile = getProfile(userId);
-  if (!profile) {
-    throw new Error("Could not load account.");
-  }
+    const profile = getProfile(userId);
+    if (!profile) {
+      throw new Error("Could not load account.");
+    }
 
-  return { profile, sessionToken, expiresAt: sessionExpiresAt(createdAt) };
+    return { profile, sessionToken, expiresAt: sessionExpiresAt(createdAt) };
+  });
 }
 
 export function getProfile(userId: string): PlayerProfile | null {
@@ -218,7 +203,7 @@ export function deleteSession(token: string | null): string | null {
   return id;
 }
 
-export function updateStatsAfterMatch(userId: string, rewards: MatchRewards): MatchStatsUpdate {
+function updateStatsAfterMatch(userId: string, rewards: MatchRewards): MatchStatsUpdate {
   const row = getUserRow(userId);
   if (!row) {
     throw new Error("User not found while updating stats.");
@@ -257,6 +242,50 @@ export function updateStatsAfterMatch(userId: string, rewards: MatchRewards): Ma
   return { xpEarned, profile };
 }
 
+export interface MatchCompletion {
+  matchId: string;
+  winnerId: string;
+  reason: "ships_sunk" | "forfeit";
+  players: { userId: string; shotsFired: number; hits: number; shipsSunk: number }[];
+}
+
+export class MatchCompletionConflict extends Error {}
+
+export function completeMatch(completion: MatchCompletion): {
+  applied: boolean;
+  updates: { userId: string; xpEarned: number; profile: PlayerProfile | null }[];
+} {
+  const { matchId, winnerId, reason } = completion;
+  const players = completion.players.map(({ userId, shotsFired, hits, shipsSunk }) => ({ userId, shotsFired, hits, shipsSunk }))
+    .sort((a, b) => a.userId < b.userId ? -1 : a.userId > b.userId ? 1 : 0);
+  if (!matchId || players.length !== 2 || players[0].userId === players[1].userId ||
+    !players.some((player) => player.userId === winnerId) || !["ships_sunk", "forfeit"].includes(reason) ||
+    players.some((player) => !player.userId || player.hits > player.shotsFired ||
+      [player.shotsFired, player.hits, player.shipsSunk].some((n) => !Number.isSafeInteger(n) || n < 0))) {
+    throw new Error("Invalid match completion.");
+  }
+  const decision = JSON.stringify({ winnerId, reason, players });
+  return inTransaction(db, () => {
+    const existing = db.prepare("SELECT decision_json, awards_json FROM match_completions WHERE match_id = ?")
+      .get(matchId) as { decision_json: string; awards_json: string } | undefined;
+    if (existing) {
+      if (existing.decision_json !== decision) throw new MatchCompletionConflict(`Conflicting completion for match ${matchId}.`);
+      const awards = JSON.parse(existing.awards_json) as number[];
+      // Never restore historical totals after a stats reset, or resurrect deleted accounts.
+      return { applied: false, updates: players.map((player, index) => ({
+        userId: player.userId, xpEarned: awards[index], profile: getProfile(player.userId)
+      })) };
+    }
+
+    const rewards = players.map((player) => ({ ...player, won: player.userId === winnerId }));
+    const awards = rewards.map(calculateMatchXp);
+    db.prepare("INSERT INTO match_completions (match_id, decision_json, awards_json, completed_at) VALUES (?, ?, ?, ?)")
+      .run(matchId, decision, JSON.stringify(awards), now());
+    const updates = rewards.map((reward) => ({ userId: reward.userId, ...updateStatsAfterMatch(reward.userId, reward) }));
+    return { applied: true, updates };
+  });
+}
+
 export function profileHitRate(profile: PlayerProfile): number {
   return hitRate(profile.stats);
 }
@@ -286,6 +315,7 @@ export function getDatabaseStats(): DatabaseStats {
 }
 
 export function resetDatabase(scope: ResetScope): DatabaseStats {
+  // Completion receipts deliberately survive every reset, including account deletion.
   switch (scope) {
     case "sessions":
       db.prepare("DELETE FROM sessions").run();

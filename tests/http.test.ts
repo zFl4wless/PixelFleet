@@ -1,10 +1,28 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { clearSessionCookie, getClientIp, getSessionToken, InvalidCookieError, isAllowedOrigin, isSecureRequest, isTrustedOrigin, sessionCookie, setCors } from "../apps/backend/src/http";
+import { clearSessionCookie, getClientIp, getSessionToken, InvalidCookieError, isAllowedOrigin, isSecureRequest, isTrustedOrigin, sendJson, sessionCookie, setCors } from "../apps/backend/src/http";
 
 const originalFrontendOrigin = process.env.FRONTEND_ORIGIN;
 const originalNodeEnv = process.env.NODE_ENV;
 const originalTrustProxy = process.env.TRUST_PROXY;
+
+describe("HTTP response boundary (TD-07)", () => {
+  it.each(["headersSent", "writableEnded", "destroyed"])("never writes JSON after %s", (state) => {
+    const response = { [state]: true, writeHead: vi.fn(), end: vi.fn() };
+    sendJson(response as unknown as ServerResponse, 500, { error: "Internal server error." });
+    expect(response.writeHead).not.toHaveBeenCalled();
+    expect(response.end).not.toHaveBeenCalled();
+  });
+
+  it("leaves headers uncommitted when serialization fails so the handler can return a 500", () => {
+    const response = { writeHead: vi.fn(), end: vi.fn() };
+    expect(() => sendJson(response as unknown as ServerResponse, 200, { value: 1n })).toThrow(TypeError);
+    expect(response.writeHead).not.toHaveBeenCalled();
+    sendJson(response as unknown as ServerResponse, 500, { error: "Internal server error." });
+    expect(response.writeHead).toHaveBeenCalledTimes(1);
+    expect(response.end).toHaveBeenCalledExactlyOnceWith('{"error":"Internal server error."}');
+  });
+});
 
 afterEach(() => {
   vi.useRealTimers();

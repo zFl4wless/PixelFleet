@@ -1,5 +1,5 @@
 import WebSocket from "ws";
-import { createRandomFleet } from "@pixelfleet/shared";
+import { createRandomFleet, WS_PROTOCOL } from "@pixelfleet/shared";
 
 const baseUrl = process.env.SMOKE_BASE_URL ?? "http://localhost:5173";
 const wsUrl = baseUrl.replace(/^http/, "ws") + "/ws";
@@ -37,13 +37,19 @@ async function createClient(username, seed) {
     finished: null,
     errors: [],
     messages: [],
+    initialized: false,
     targets: Array.from({ length: 100 }, (_, index) => ({ x: index % 10, y: Math.floor(index / 10) })),
-    ws: new WebSocket(wsUrl, { headers: { Cookie: cookie } })
+    ws: new WebSocket(wsUrl, WS_PROTOCOL, { headers: { Cookie: cookie } })
   };
 
   client.ws.on("message", (payload) => {
     const message = JSON.parse(payload.toString());
     client.messages.push(message);
+    if (message.type === "session_snapshot") {
+      if (message.profile.userId !== profile.userId || message.state.kind !== "lobby") throw new Error("Unexpected initial smoke state");
+      client.profile = message.profile;
+      client.initialized = true;
+    }
     if (message.type === "game_update" || message.type === "match_finished") {
       client.view = message.view;
     }
@@ -55,7 +61,7 @@ async function createClient(username, seed) {
     }
   });
 
-  await waitFor(() => client.ws.readyState === WebSocket.OPEN, `${username} websocket open`);
+  await waitFor(() => client.ws.readyState === WebSocket.OPEN && client.initialized, `${username} initialized websocket`);
   client.placements = createRandomFleet(seededRandom(seed));
   return client;
 }

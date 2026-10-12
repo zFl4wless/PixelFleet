@@ -5,6 +5,7 @@ dist
 !.env.example
 !apps/*/.env.example
 coverage
+test-results
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal

@@ -36,7 +36,7 @@ tests             Vitest coverage for game and server behavior
 Pixel Fleet requires Node.js 24 or newer.
 
 ```bash
-npm install
+npm ci
 npm run dev
 ```
 
@@ -47,6 +47,19 @@ Local development URLs:
 
 The Vite dev server proxies `/api` and `/ws` to the backend so guest-session cookies work from the local frontend
 origin.
+
+Vite development and preview bind to `127.0.0.1` by default. To deliberately expose
+them to your LAN, use the following commands from the repository root (development
+also needs `npm run dev:backend` in another terminal):
+
+```bash
+npm run dev -w apps/frontend -- --host 0.0.0.0
+npm run preview -w apps/frontend -- --host 0.0.0.0
+```
+
+Preview requires `npm run build` first and serves static files; use the production
+backend for working API/WebSocket connections. Loopback reduces network exposure,
+but does not replace dependency fixes or protect against every local/browser attack.
 
 ## Useful Scripts
 

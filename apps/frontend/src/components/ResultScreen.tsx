@@ -1,7 +1,7 @@
 import type { PublicMatchView } from "@pixelfleet/shared";
 import { EightBitAlert, EightBitBadge, EightBitButton, EightBitTable } from "./8bit";
 
-export function ResultScreen({ view, onBack }: { view: PublicMatchView; onBack: () => void }) {
+export function ResultScreen({ view, connected, onBack }: { view: PublicMatchView; connected: boolean; onBack: () => void }) {
   const result = view.result;
 
   return (
@@ -21,7 +21,7 @@ export function ResultScreen({ view, onBack }: { view: PublicMatchView; onBack: 
             { label: "Games Played", value: result?.profile.stats.gamesPlayed ?? "-" }
           ]}
         />
-        <EightBitButton size="lg" onClick={onBack}>
+        <EightBitButton size="lg" disabled={!connected} onClick={onBack}>
           Back to Lobby
         </EightBitButton>
       </section>

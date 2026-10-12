@@ -10,6 +10,15 @@ interface Bucket {
   resetAt: number;
 }
 
+export const RATE_LIMIT_CLEANUP_INTERVAL_MS = 30_000;
+
+// The server owns this single timer for all HTTP/account quotas, across admin resets.
+export function startRateLimitCleanup(cleanup: (now: number) => void): () => void {
+  const timer = setInterval(() => cleanup(Date.now()), RATE_LIMIT_CLEANUP_INTERVAL_MS);
+  timer.unref();
+  return () => clearInterval(timer);
+}
+
 export class FixedWindowRateLimiter {
   private readonly buckets = new Map<string, Bucket>();
 

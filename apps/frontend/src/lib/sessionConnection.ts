@@ -1,4 +1,4 @@
-import type { ClientMessage, PlayerProfile, ServerMessage } from "@pixelfleet/shared";
+import { WS_PROTOCOL, type ClientMessage, type PlayerProfile, type ServerMessage, type SessionSnapshot } from "@pixelfleet/shared";
 import { fetchMe, logoutGuest } from "./api";
 
 interface Callbacks {
@@ -6,6 +6,7 @@ interface Callbacks {
   loading: (loading: boolean) => void;
   connected: (connected: boolean) => void;
   reset: () => void;
+  snapshot: (snapshot: SessionSnapshot) => void;
   message: (message: ServerMessage) => void;
   error: (message: string) => void;
 }
@@ -21,7 +22,7 @@ interface Transport {
 const browserTransport: Transport = {
   fetchProfile: fetchMe,
   logout: logoutGuest,
-  openSocket: () => new WebSocket(`${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/ws`),
+  openSocket: () => new WebSocket(`${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/ws`, WS_PROTOCOL),
   setTimeout: (callback, delay) => window.setTimeout(callback, delay),
   clearTimeout: (timer) => window.clearTimeout(timer)
 };
@@ -36,6 +37,7 @@ export class SessionConnection {
   private request: AbortController | null = null;
   private reconnectTimer: number | null = null;
   private logoutPending = false;
+  private initialized = false;
 
   constructor(private readonly callbacks: Callbacks, private readonly transport: Transport = browserTransport) {}
 
@@ -60,7 +62,7 @@ export class SessionConnection {
   }
 
   send(message: ClientMessage): boolean {
-    if (!this.active || !this.socket || this.socket.readyState !== 1) return false;
+    if (!this.active || !this.initialized || !this.socket || this.socket.readyState !== 1) return false;
     this.socket.send(JSON.stringify(message));
     return true;
   }
@@ -91,6 +93,7 @@ export class SessionConnection {
   }
 
   private invalidate(): void {
+    this.initialized = false;
     this.generation += 1;
     this.logoutPending = false;
     this.request?.abort();
@@ -139,14 +142,32 @@ export class SessionConnection {
     if (!this.isCurrent(generation) || !this.profile) return;
     const ws = this.transport.openSocket();
     this.socket = ws;
+    this.initialized = false;
     const current = () => this.isCurrent(generation) && this.socket === ws;
-    ws.onopen = () => {
-      if (current() && ws.readyState === 1) this.callbacks.connected(true);
-    };
     ws.onmessage = (event) => {
       if (!current() || ws.readyState !== 1) return;
-      const message = JSON.parse(event.data) as ServerMessage;
-      if (message.type === "profile") {
+      let message: ServerMessage;
+      try { message = JSON.parse(event.data) as ServerMessage; }
+      catch { this.protocolFailure(ws); return; }
+      if (message?.type === "session_snapshot") {
+        const { profile, state } = message;
+        if (!profile || typeof profile.userId !== "string" || !state ||
+          !["lobby", "queue", "match"].includes(state.kind) ||
+          (state.kind === "match" && (!state.view || state.view.you?.userId !== profile.userId ||
+            typeof state.view.matchId !== "string" || !["placing", "playing", "saving", "save_failed", "finished"].includes(state.view.phase)))) {
+          this.protocolFailure(ws); return;
+        }
+        if (profile.userId !== this.profile?.userId) {
+          this.setAccount(profile);
+          return;
+        }
+        this.profile = profile;
+        this.callbacks.snapshot({ profile, state });
+        this.initialized = true;
+        this.callbacks.connected(true);
+      } else if (!this.initialized) {
+        this.protocolFailure(ws);
+      } else if (message.type === "profile") {
         if (message.profile.userId !== this.profile?.userId) {
           this.setAccount(message.profile);
         } else {
@@ -160,15 +181,25 @@ export class SessionConnection {
     ws.onclose = (event) => {
       if (!current()) return;
       this.socket = null;
+      this.initialized = false;
       this.callbacks.connected(false);
       if (event.code === 4003) { // GameHub.revokeSession
         this.setAccount(null);
       } else if (event.code === 4001) { // GameHub.connect replaced this connection
         this.callbacks.error("Another connection replaced this one.");
+      } else if (event.code === 4002) {
+        this.callbacks.error("Pixel Fleet was updated. Reload this page to reconnect.");
       } else {
         this.scheduleReconnect(generation);
       }
     };
+  }
+
+  private protocolFailure(ws: WebSocket): void {
+    this.initialized = false;
+    this.callbacks.connected(false);
+    this.callbacks.error("Cannot initialize this connection. Reload this page to update Pixel Fleet.");
+    ws.close(4002, "Snapshot required");
   }
 
   private scheduleReconnect(generation: number): void {
