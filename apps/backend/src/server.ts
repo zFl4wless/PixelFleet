@@ -325,9 +325,9 @@ const server = createServer(async (req, res) => {
 
       const body = await readJson<{ username?: string }>(req);
       const username = body.username ?? "";
-      const { profile, sessionToken } = createGuestAccount(username);
+      const { profile, sessionToken, expiresAt } = createGuestAccount(username);
       metrics.inc("guest_accounts_created_total");
-      res.setHeader("Set-Cookie", sessionCookie(sessionToken, isSecureRequest(req)));
+      res.setHeader("Set-Cookie", sessionCookie(sessionToken, isSecureRequest(req), expiresAt));
       sendJson(res, 201, { profile });
       return;
     }
@@ -447,7 +447,7 @@ server.on("upgrade", (req, socket, head) => {
       upgrade.releaseConnection = releaseConnection;
       heartbeatSocket.once("close", releaseConnection);
 
-      hub.connect(ws, session.profile, { ip, sessionId: session.id });
+      hub.connect(ws, session.profile, { ip, sessionId: session.id, expiresAt: session.expiresAt });
     });
   } catch (error) {
     // Failed attempts remain rate-limited; only an acquired active slot is released.

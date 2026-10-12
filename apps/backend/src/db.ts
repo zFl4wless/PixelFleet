@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
+import { sessionExpiresAt } from "./session-lifetime.js";
 import {
   calculateMatchXp,
   hitRate,
@@ -138,7 +139,7 @@ function assertAllowedUsername(username: string): void {
   }
 }
 
-export function createGuestAccount(username: string): { profile: PlayerProfile; sessionToken: string } {
+export function createGuestAccount(username: string): { profile: PlayerProfile; sessionToken: string; expiresAt: number } {
   const safeUsername = sanitizeUsername(username);
   if (safeUsername.length < 2) {
     throw new Error("Username must be at least 2 characters.");
@@ -169,7 +170,7 @@ export function createGuestAccount(username: string): { profile: PlayerProfile; 
     throw new Error("Could not load account.");
   }
 
-  return { profile, sessionToken };
+  return { profile, sessionToken, expiresAt: sessionExpiresAt(createdAt) };
 }
 
 export function getProfile(userId: string): PlayerProfile | null {
@@ -177,7 +178,7 @@ export function getProfile(userId: string): PlayerProfile | null {
   return row ? toProfile(row) : null;
 }
 
-export function getSessionByToken(token: string | null): { id: string; profile: PlayerProfile } | null {
+export function getSessionByToken(token: string | null): { id: string; profile: PlayerProfile; expiresAt: number } | null {
   if (!token) {
     return null;
   }
@@ -185,18 +186,23 @@ export function getSessionByToken(token: string | null): { id: string; profile: 
   const id = tokenHash(token);
   const row = db
     .prepare(
-      `SELECT users.* FROM sessions
+      `SELECT users.*, sessions.created_at AS session_created_at FROM sessions
        JOIN users ON users.user_id = sessions.user_id
        WHERE sessions.token_hash = ?`
     )
-    .get(id) as UserRow | undefined;
+    .get(id) as (UserRow & { session_created_at: string }) | undefined;
 
   if (!row) {
     return null;
   }
 
+  const expiresAt = sessionExpiresAt(row.session_created_at);
+  if (!Number.isFinite(expiresAt) || Date.now() >= expiresAt) {
+    return null;
+  }
+
   db.prepare("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?").run(now(), id);
-  return { id, profile: toProfile(row) };
+  return { id, profile: toProfile(row), expiresAt };
 }
 
 export function getProfileBySessionToken(token: string | null): PlayerProfile | null {

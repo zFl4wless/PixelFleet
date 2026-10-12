@@ -93,7 +93,14 @@ function independentSession(profile: PlayerProfile) {
 }
 
 function connect(profile: PlayerProfile, sessionId: string, socket = new TestSocket()) {
-  hub.connect(socket as unknown as WebSocket, profile, { ip: "127.0.0.1", sessionId });
+  const fixture = new DatabaseSync(join(directory, "fixture.sqlite"));
+  let createdAt: string;
+  try {
+    createdAt = (fixture.prepare("SELECT created_at FROM sessions WHERE token_hash = ?").get(sessionId) as { created_at: string }).created_at;
+  } finally {
+    fixture.close();
+  }
+  hub.connect(socket as unknown as WebSocket, profile, { ip: "127.0.0.1", sessionId, expiresAt: Date.parse(createdAt) + 365 * 24 * 60 * 60 * 1000 });
   return socket;
 }
 

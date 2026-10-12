@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { clearSessionCookie, getClientIp, getSessionToken, InvalidCookieError, isAllowedOrigin, isSecureRequest, isTrustedOrigin, sessionCookie, setCors } from "../apps/backend/src/http";
 
@@ -7,6 +7,7 @@ const originalNodeEnv = process.env.NODE_ENV;
 const originalTrustProxy = process.env.TRUST_PROXY;
 
 afterEach(() => {
+  vi.useRealTimers();
   if (originalFrontendOrigin === undefined) {
     delete process.env.FRONTEND_ORIGIN;
   } else {
@@ -75,6 +76,7 @@ describe("proxy trust and cookie transport", () => {
   });
 
   it("uses the same transport decision and cookie scope for session issue and deletion", () => {
+    vi.useFakeTimers();
     const cases = [
       { trust: "false", tls: false, proto: undefined, secure: false },
       { trust: "false", tls: false, proto: "https", secure: false },
@@ -88,7 +90,7 @@ describe("proxy trust and cookie transport", () => {
       process.env.TRUST_PROXY = fixture.trust;
       const secure = isSecureRequest(request({ "x-forwarded-proto": fixture.proto }, fixture.tls));
       expect(secure).toBe(fixture.secure);
-      const issued = sessionCookie("dummy-session-token", secure).split("; ");
+      const issued = sessionCookie("dummy-session-token", secure, Date.now() + 365 * 24 * 60 * 60 * 1000).split("; ");
       const cleared = clearSessionCookie(secure).split("; ");
       expect(issued[0]).toBe("pf_session=dummy-session-token");
       expect(cleared[0]).toBe("pf_session=");

@@ -65,12 +65,13 @@ afterAll(async () => {
 
 function guest(username = "Match dummy") {
   const { profile, sessionToken } = database.createGuestAccount(username);
-  return { profile, sessionId: database.getSessionByToken(sessionToken)!.id };
+  const session = database.getSessionByToken(sessionToken)!;
+  return { profile, sessionId: session.id, expiresAt: session.expiresAt };
 }
 
 function connect(player: ReturnType<typeof guest>) {
   const socket = new TestSocket();
-  hub.connect(socket as unknown as WebSocket, player.profile, { ip: "127.0.0.1", sessionId: player.sessionId });
+  hub.connect(socket as unknown as WebSocket, player.profile, { ip: "127.0.0.1", sessionId: player.sessionId, expiresAt: player.expiresAt });
   return socket;
 }
 

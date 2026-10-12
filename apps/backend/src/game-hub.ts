@@ -25,6 +25,7 @@ import { metrics } from "./metrics.js";
 import { FixedWindowRateLimiter, parseEnvInt } from "./rate-limit.js";
 
 const RECONNECT_GRACE_MS = 30_000;
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 const MAX_WS_PAYLOAD_BYTES = parseEnvInt("MAX_WS_PAYLOAD_BYTES", 4096);
 
 interface ClientConnection {
@@ -33,6 +34,8 @@ interface ClientConnection {
   profile: PlayerProfile;
   ip: string;
   sessionId: string;
+  expiresAt: number;
+  expiryTimer?: NodeJS.Timeout;
   revoked: boolean;
 }
 
@@ -72,6 +75,7 @@ export interface HubStats {
 interface ClientContext {
   ip: string;
   sessionId: string;
+  expiresAt: number;
 }
 
 export class GameHub {
@@ -94,9 +98,15 @@ export class GameHub {
   private readonly invalidActionCounts = new Map<string, number>();
 
   connect(ws: WebSocket, profile: PlayerProfile, context: ClientContext): void {
+    // The deadline may have passed between HTTP authentication and upgrade completion.
+    if (!Number.isFinite(context.expiresAt) || Date.now() >= context.expiresAt) {
+      ws.close(4003, "Session revoked");
+      return;
+    }
     const existing = this.connections.get(profile.userId);
     if (existing) {
       existing.revoked = true;
+      this.clearSessionExpiry(existing);
     }
 
     const connection: ClientConnection = { userId: profile.userId, ws, profile, ...context, revoked: false };
@@ -106,8 +116,11 @@ export class GameHub {
     if (existing && existing.ws !== ws) {
       existing.ws.close(4001, "New connection opened");
     }
+    this.scheduleSessionExpiry(connection);
+    if (!this.isCurrentConnection(connection)) return;
     metrics.inc("ws_connections_accepted_total");
     this.send(profile.userId, { type: "profile", profile });
+    if (!this.isCurrentConnection(connection)) return;
 
     const match = this.findActiveMatchForUser(profile.userId);
     if (match) {
@@ -132,8 +145,31 @@ export class GameHub {
   }
 
   private isCurrentConnection(connection: ClientConnection): boolean {
-    return !connection.revoked && connection.ws.readyState === WebSocket.OPEN &&
-      this.connections.get(connection.userId) === connection;
+    if (connection.revoked || this.connections.get(connection.userId) !== connection) return false;
+    // Also enforce expiry if the event loop has not delivered the timer callback yet.
+    if (Date.now() >= connection.expiresAt) {
+      this.revokeSession(connection.sessionId);
+      return false;
+    }
+    return connection.ws.readyState === WebSocket.OPEN;
+  }
+
+  private clearSessionExpiry(connection: ClientConnection): void {
+    if (connection.expiryTimer) clearTimeout(connection.expiryTimer);
+    connection.expiryTimer = undefined;
+  }
+
+  private scheduleSessionExpiry(connection: ClientConnection): void {
+    if (connection.revoked || this.connections.get(connection.userId) !== connection) return;
+    const remaining = connection.expiresAt - Date.now();
+    if (remaining <= 0) {
+      this.revokeSession(connection.sessionId);
+      return;
+    }
+    connection.expiryTimer = setTimeout(() => {
+      connection.expiryTimer = undefined;
+      this.scheduleSessionExpiry(connection);
+    }, Math.min(remaining, MAX_TIMEOUT_MS));
   }
 
   revokeSession(sessionId: string): void {
@@ -149,6 +185,7 @@ export class GameHub {
 
   private disconnect(connection: ClientConnection): void {
     connection.revoked = true;
+    this.clearSessionExpiry(connection);
     const { userId } = connection;
     if (this.connections.get(userId) !== connection) {
       return;
@@ -702,6 +739,7 @@ export class GameHub {
     const connections = [...this.connections.values()];
     for (const connection of connections) {
       connection.revoked = true;
+      this.clearSessionExpiry(connection);
     }
     for (const match of this.matches.values()) {
       for (const timer of match.reconnectTimers.values()) {

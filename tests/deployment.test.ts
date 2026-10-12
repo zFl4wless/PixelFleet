@@ -41,7 +41,7 @@ afterEach(async () => {
   await rm(directory, { recursive: true, force: true });
 });
 
-function launch(overrides: Record<string, string> = {}, entrypoint = "apps/backend/src/server.ts") {
+function launch(overrides: Record<string, string> = {}, entrypoint = "apps/backend/src/server.ts", ipc = false) {
   const child = spawn(process.execPath, ["--import", "tsx", entrypoint], {
     env: {
       ...process.env,
@@ -54,7 +54,7 @@ function launch(overrides: Record<string, string> = {}, entrypoint = "apps/backe
       TRUST_PROXY: "true",
       ...overrides
     },
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ipc ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"]
   });
   children.push(child);
   let output = "";
@@ -150,6 +150,83 @@ async function rejectedUpgrade(url: string, cookie?: string, origin = url, heade
 }
 
 describe("production deployment", () => {
+  it("enforces an existing session's fixed deadline for HTTP and upgrades, expires an idle socket and retains account data", async () => {
+    const start = Date.parse("2026-10-12T12:00:00.000Z");
+    const yearMs = 365 * 24 * 60 * 60 * 1000;
+    // Clock control exists only in this disposable test process, never in the application.
+    // Only Date is mocked: expiry uses real Node timers and native WebSocket close events.
+    const entrypoint = join(directory, "expiry-clock.mjs");
+    const serverUrl = pathToFileURL(join(process.cwd(), "apps/backend/src/server.ts")).href;
+    await writeFile(entrypoint, `
+      import { mock } from "node:test";
+      mock.timers.enable({ apis: ["Date"], now: ${start} });
+      process.on("message", ({ now }) => {
+        mock.timers.setTime(now);
+        process.send({ now: Date.now() });
+      });
+      await import(${JSON.stringify(serverUrl)});
+    `);
+    const { child, ready } = launch({}, entrypoint, true);
+    const url = await ready;
+    async function clock(now: number) {
+      const acknowledged = once(child, "message");
+      child.send!({ now });
+      expect((await acknowledged)[0]).toEqual({ now });
+    }
+    const player = await loginGuest(url, "Legacy expiry dummy");
+    const token = player.cookie.slice("pf_session=".length);
+    const hash = createHash("sha256").update(token).digest("hex");
+    const expiresAt = start + 1000;
+    const createdAt = new Date(expiresAt - yearMs).toISOString();
+    const fixtureDatabase = new DatabaseSync(join(directory, "pixelfleet.sqlite"));
+    try {
+      fixtureDatabase.prepare("UPDATE sessions SET created_at = ?, last_seen_at = ? WHERE token_hash = ?")
+        .run(createdAt, createdAt, hash);
+      fixtureDatabase.prepare("UPDATE users SET xp = 123, wins = 1, games_played = 1 WHERE user_id = ?")
+        .run(player.profile.userId);
+      const opened = await openSessionSocket(url, player.cookie);
+      const closed = once(opened.socket, "close");
+      await clock(expiresAt - 1);
+      const before = await fetch(`${url}/api/me`, { headers: { Cookie: player.cookie } });
+      expect(before.status).toBe(200);
+      expect((await before.json()).profile).toMatchObject({ userId: player.profile.userId, xp: 123, stats: { wins: 1 } });
+      const reused = await fetch(`${url}/api/guest-login`, {
+        method: "POST", headers: { Cookie: player.cookie, Origin: url }
+      });
+      expect(reused.status).toBe(200);
+      expect(reused.headers.get("set-cookie")).toBeNull(); // activity does not reissue a full-year cookie
+      await reused.json();
+      // Authenticate one more new socket immediately before the boundary.
+      const replacement = await openSessionSocket(url, player.cookie);
+      expect((await closed)[0]).toBe(4001);
+      const expired = once(replacement.socket, "close");
+      await clock(expiresAt);
+      expect((await expired)[0]).toBe(4003); // no additional WebSocket message
+      for (const now of [expiresAt, expiresAt + 1]) {
+        await clock(now);
+        const me = await fetch(`${url}/api/me`, { headers: { Cookie: player.cookie } });
+        expect(me.status).toBe(401);
+        await me.json();
+        expect(await rejectedUpgrade(url, player.cookie)).toBe(401);
+      }
+      expect(fixtureDatabase.prepare("SELECT created_at FROM sessions WHERE token_hash = ?").get(hash)).toEqual({ created_at: createdAt });
+      expect(fixtureDatabase.prepare("SELECT xp, wins, games_played FROM users WHERE user_id = ?").get(player.profile.userId))
+        .toEqual({ xp: 123, wins: 1, games_played: 1 });
+      const fresh = await fetch(`${url}/api/guest-login`, {
+        method: "POST", headers: { Cookie: player.cookie, Origin: url, "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "Legacy expiry dummy" })
+      });
+      expect(fresh.status).toBe(201);
+      expect(fresh.headers.get("set-cookie")).toContain("Max-Age=31536000;");
+      expect((await fresh.json()).profile.userId).not.toBe(player.profile.userId);
+      const health = await fetch(`${url}/api/health`);
+      expect((await health.json()).hub.activeConnections).toBe(0);
+    } finally {
+      fixtureDatabase.close();
+    }
+    await stop(child);
+  }, 15_000);
+
   it.each(["false", "true"])("keeps login and logout cookie attributes consistent with TRUST_PROXY=%s", async (trust) => {
     const { child, ready } = launch({ TRUST_PROXY: trust });
     const url = await ready;
@@ -171,7 +248,9 @@ describe("production deployment", () => {
       const attributes = ["Path=/", "HttpOnly", "SameSite=Lax", ...(trust === "true" && proto === "https" ? ["Secure"] : [])];
       expect(issued[0]).toMatch(/^pf_session=.+/);
       expect(cleared[0]).toBe("pf_session=");
-      expect(issued).toContain("Max-Age=31536000");
+      const maxAge = Number(issued.find((part) => part.startsWith("Max-Age="))?.slice("Max-Age=".length));
+      expect(maxAge).toBeGreaterThanOrEqual(31535999);
+      expect(maxAge).toBeLessThanOrEqual(31536000);
       expect(cleared).toContain("Max-Age=0");
       expect(issued.slice(1).filter((part) => !part.startsWith("Max-Age="))).toEqual(attributes);
       expect(cleared.slice(1).filter((part) => !part.startsWith("Max-Age="))).toEqual(attributes);

@@ -131,6 +131,8 @@ Admin endpoints require `ADMIN_TOKEN`.
 
 - Usernames are display names only; guest login never looks up users by username.
 - Session cookies store a random token; the database stores only a SHA-256 token hash.
+- Guest sessions expire exactly 365 days (365 × 24 hours) after their original creation, enforced by the server for HTTP and WebSockets. Activity does not renew the deadline; logout revokes the session immediately. Existing sessions retain their stored creation time.
+- Cookie lifetime uses the same deadline, rounded down to whole remaining seconds. Expiry does not delete the guest account or its statistics. Without a separate recovery feature, expiry loses access to that guest account; logging in again creates a new account.
 - Clearing browser cookies loses access to the guest account.
 - Hidden enemy ship positions are never sent to the client.
 - Shots and match transitions are validated on the server.

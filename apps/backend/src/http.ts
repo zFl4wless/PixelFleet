@@ -2,7 +2,6 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { isIP } from "node:net";
 
 const SESSION_COOKIE_NAME = "pf_session";
-const ONE_YEAR_SECONDS = 60 * 60 * 24 * 365;
 const DEFAULT_MAX_JSON_BYTES = 16 * 1024;
 const VITE_DEV_PORTS = new Set(["5173", "5174", "5175", "5176", "5177", "5178", "5179"]);
 
@@ -42,11 +41,13 @@ export function getSessionToken(req: IncomingMessage): string | null {
   return parseCookies(req.headers.cookie)[SESSION_COOKIE_NAME] ?? null;
 }
 
-export function sessionCookie(token: string, secure: boolean): string {
+export function sessionCookie(token: string, secure: boolean, expiresAt: number): string {
   const secureFlag = secure ? "; Secure" : "";
+  // Cookie precision is seconds: round down the remaining server-side lifetime.
+  const maxAge = Number.isFinite(expiresAt) ? Math.max(0, Math.floor((expiresAt - Date.now()) / 1000)) : 0;
   return `${SESSION_COOKIE_NAME}=${encodeURIComponent(
     token
-  )}; Path=/; Max-Age=${ONE_YEAR_SECONDS}; HttpOnly; SameSite=Lax${secureFlag}`;
+  )}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax${secureFlag}`;
 }
 
 export function clearSessionCookie(secure: boolean): string {

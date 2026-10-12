@@ -198,8 +198,9 @@ function PrivacyPolicy() {
         <h2>Cookies And Local Storage</h2>
         <p>
           Pixel Fleet currently uses the strictly necessary session cookie <code>pf_session</code>. It is HttpOnly,
-          SameSite=Lax, and can be stored for up to one year so a guest account can be recognized. The app does not
-          currently use advertising, tracking, or analytics cookies.
+          SameSite=Lax, and lasts at most 365 days from the session's original creation. The server enforces the same
+          fixed deadline for HTTP and WebSocket access; activity does not renew it, and logout revokes access immediately.
+          The app does not currently use advertising, tracking, or analytics cookies.
         </p>
       </section>
 
@@ -224,8 +225,10 @@ function PrivacyPolicy() {
       <section className="legal-section">
         <h2>Retention</h2>
         <p>
-          Session data is kept while the guest account session is active or until the session is cleared. Guest account
-          profiles and match statistics may remain on the server until deletion, reset, or the end of the configured
+          Guest sessions stop granting access exactly 365 days after their original creation. Expiry does not delete
+          account profiles or statistics; expired session records may remain until cleared or reset. Without a separate
+          recovery feature, there is no way to regain access to that guest account after expiry. A new guest login creates
+          a new account. Guest account profiles and match statistics may remain on the server until deletion, reset, or the end of the configured
           retention period. Technical logs should be kept only as long as necessary for security and operation. Technical
           logs: {legalConfig.logRetention}. Guest accounts and match statistics: {legalConfig.accountRetention}.
         </p>
