@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { frontendPageFromPath } from "@pixelfleet/shared";
 import type { ClientMessage, PlayerProfile, PublicCell, PublicMatchView, ServerMessage, ShipPlacement } from "@pixelfleet/shared";
-import { fetchMe, logoutGuest } from "./lib/api";
+import { SessionConnection } from "./lib/sessionConnection";
 import { GameScreen } from "./components/GameScreen";
 import { Lobby } from "./components/Lobby";
 import { LoginScreen } from "./components/LoginScreen";
@@ -31,8 +31,6 @@ function GameApp() {
   const [queued, setQueued] = useState(false);
   const [matchView, setMatchView] = useState<PublicMatchView | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
-  const socketRef = useRef<WebSocket | null>(null);
-  const reconnectRef = useRef<number | null>(null);
 
   const pushToast = useCallback((toast: Omit<Toast, "id">) => {
     const id = crypto.randomUUID();
@@ -42,60 +40,26 @@ function GameApp() {
     }, 4200);
   }, []);
 
-  useEffect(() => {
-    fetchMe()
-      .then(setProfile)
-      .finally(() => setLoading(false));
-  }, []);
+  const [session] = useState(() => new SessionConnection({
+    profile: setProfile,
+    loading: setLoading,
+    connected: setSocketConnected,
+    reset: () => {
+      setMatchView(null);
+      setQueued(false);
+      setToasts([]);
+    },
+    message: handleServerMessage,
+    error: (message) => pushToast({ tone: "danger", message })
+  }));
 
   useEffect(() => {
-    if (!profile) {
-      socketRef.current?.close();
-      socketRef.current = null;
-      setSocketConnected(false);
-      return;
-    }
-
-    let disposed = false;
-
-    function connect() {
-      if (disposed) {
-        return;
-      }
-
-      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-      const ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
-      socketRef.current = ws;
-
-      ws.onopen = () => setSocketConnected(true);
-      ws.onclose = () => {
-        setSocketConnected(false);
-        if (!disposed) {
-          reconnectRef.current = window.setTimeout(connect, 1200);
-        }
-      };
-      ws.onmessage = (event) => {
-        const message = JSON.parse(event.data) as ServerMessage;
-        handleServerMessage(message);
-      };
-    }
-
-    connect();
-
-    return () => {
-      disposed = true;
-      if (reconnectRef.current) {
-        window.clearTimeout(reconnectRef.current);
-      }
-      socketRef.current?.close();
-    };
-  }, [profile?.userId]);
+    session.start();
+    return () => session.stop();
+  }, [session]);
 
   function handleServerMessage(message: ServerMessage) {
     switch (message.type) {
-      case "profile":
-        setProfile(message.profile);
-        break;
       case "queue_status":
         setQueued(message.queued);
         if (message.message.includes("found")) {
@@ -127,18 +91,9 @@ function GameApp() {
   }
 
   function send(message: ClientMessage) {
-    if (socketRef.current?.readyState !== WebSocket.OPEN) {
+    if (!session.send(message)) {
       pushToast({ tone: "warning", message: "Server connection is reconnecting." });
-      return;
     }
-    socketRef.current.send(JSON.stringify(message));
-  }
-
-  async function logout() {
-    await logoutGuest();
-    setProfile(null);
-    setMatchView(null);
-    setQueued(false);
   }
 
   if (loading) {
@@ -154,7 +109,7 @@ function GameApp() {
   return (
     <>
       {!profile ? (
-        <LoginScreen onLogin={setProfile} />
+        <LoginScreen onLogin={session.loginHandler()} />
       ) : matchView?.phase === "finished" ? (
         <ResultScreen
           view={matchView}
@@ -172,7 +127,7 @@ function GameApp() {
       ) : queued ? (
         <Matchmaking onCancel={() => send({ type: "cancel_queue" })} />
       ) : (
-        <Lobby profile={profile} connected={socketConnected} onStart={() => send({ type: "join_queue" })} onLogout={logout} />
+        <Lobby profile={profile} connected={socketConnected} onStart={() => send({ type: "join_queue" })} onLogout={() => void session.logout()} />
       )}
       <LegalFooter />
       <EightBitToastViewport

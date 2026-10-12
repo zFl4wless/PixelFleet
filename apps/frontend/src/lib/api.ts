@@ -1,5 +1,11 @@
 import type { PlayerProfile } from "@pixelfleet/shared";
 
+class RequestError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -12,18 +18,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!response.ok) {
     const body = (await response.json().catch(() => ({}))) as { error?: string };
-    throw new Error(body.error ?? "Request failed.");
+    throw new RequestError(body.error ?? "Request failed.", response.status);
   }
 
   return response.json() as Promise<T>;
 }
 
-export async function fetchMe(): Promise<PlayerProfile | null> {
+export async function fetchMe(signal?: AbortSignal): Promise<PlayerProfile | null> {
   try {
-    const body = await request<{ profile: PlayerProfile }>("/api/me");
+    const body = await request<{ profile: PlayerProfile }>("/api/me", { signal });
     return body.profile;
-  } catch {
-    return null;
+  } catch (error) {
+    if (error instanceof RequestError && error.status === 401) return null;
+    throw error;
   }
 }
 
