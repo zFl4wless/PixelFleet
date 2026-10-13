@@ -23,6 +23,7 @@ function match(matchId: string): PublicMatchView {
 // Browser transport double: close completion and already queued callbacks can be
 // delivered after replacement. No listener, browser, database or network is used.
 class ControlledSocket {
+  constructor(private readonly initialProfile: PlayerProfile) {}
   readyState = 0;
   onopen: WebSocket["onopen"] = null;
   onmessage: WebSocket["onmessage"] = null;
@@ -30,9 +31,10 @@ class ControlledSocket {
   sent: unknown[] = [];
   closeCalls = 0;
 
-  open() {
+  open(initialize = true) {
     this.readyState = 1;
     this.onopen?.call(this as unknown as WebSocket, {} as Event);
+    if (initialize) this.message({ type: "session_snapshot", profile: this.initialProfile, state: { kind: "lobby" } });
   }
   message(message: ServerMessage) {
     this.onmessage?.call(this as unknown as WebSocket, { data: JSON.stringify(message) } as MessageEvent);
@@ -90,6 +92,12 @@ function fixture() {
     loading: (value) => { state.loading = value; notifications.push("loading"); },
     connected: (value) => { state.connected = value; notifications.push("connected"); },
     reset: () => { state.queued = false; state.view = null; state.toasts = []; notifications.push("reset"); },
+    snapshot: (snapshot) => {
+      state.profile = snapshot.profile;
+      state.queued = snapshot.state.kind === "queue";
+      state.view = snapshot.state.kind === "match" ? snapshot.state.view : null;
+      notifications.push("snapshot");
+    },
     message: (message) => {
       notifications.push("message");
       if (message.type === "queue_status") state.queued = message.queued;
@@ -101,7 +109,7 @@ function fixture() {
     fetchProfile: fetchMe,
     logout: logoutGuest,
     openSocket: () => {
-      const socket = new ControlledSocket();
+      const socket = new ControlledSocket(state.profile!);
       sockets.push(socket);
       return socket as unknown as WebSocket;
     },
@@ -127,6 +135,38 @@ async function loggedIn() {
 }
 
 describe("frontend session lifecycle", () => {
+  it("waits for an authoritative snapshot before allowing actions (TD-06)", async () => {
+    const f = fixture();
+    f.session.start();
+    requests[0].respond(200, { profile: profile() });
+    await flush();
+    f.sockets[0].open(false);
+    expect(f.state.connected).toBe(false);
+    expect(f.session.send({ type: "join_queue" })).toBe(false);
+  });
+
+  it("replaces a stale queue with the server's explicit lobby on reconnect (TD-06)", async () => {
+    const f = await loggedIn();
+    f.sockets[0].message({ type: "queue_status", queued: true, message: "Searching" });
+    f.sockets[0].finishClose();
+    vi.advanceTimersByTime(1200);
+    requests[1].respond(200, { profile: profile() });
+    await flush();
+    f.sockets[1].open(false);
+    f.sockets[1].message({ type: "session_snapshot", profile: profile(), state: { kind: "lobby" } });
+    expect(f.state.queued).toBe(false);
+  });
+
+  it("rejects an old profile-only initialization and cannot send actions until a compatible snapshot (TD-06)", async () => {
+    const f = fixture(); f.session.start(); requests[0].respond(200, { profile: profile() }); await flush();
+    f.sockets[0].open(false);
+    f.sockets[0].message({ type: "profile", profile: profile() });
+    expect(f.state.connected).toBe(false); expect(f.sockets[0].closeCalls).toBe(1);
+    expect(f.session.send({ type: "join_queue" })).toBe(false);
+    f.sockets[0].finishClose(4002); vi.advanceTimersByTime(10_000);
+    expect(f.sockets).toHaveLength(1); expect(requests).toHaveLength(1);
+  });
+
   it("loads the authenticated profile, displays current events and sends actions on the open socket", async () => {
     const f = await loggedIn();
     expect(f.state).toMatchObject({ profile: profile(), loading: false, connected: true });

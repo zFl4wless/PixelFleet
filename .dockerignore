@@ -11,7 +11,7 @@
 **/*.sqlite*
 apps/backend/data
 coverage
-tests
+test-results
 docs
 README.md
 LICENSE

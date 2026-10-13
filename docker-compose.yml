@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: runtime
       args:
         VITE_LEGAL_PROVIDER_NAME: ${VITE_LEGAL_PROVIDER_NAME:-}
         VITE_LEGAL_PROVIDER_ADDRESS: ${VITE_LEGAL_PROVIDER_ADDRESS:-}
@@ -31,6 +32,7 @@ services:
       QUEUE_ACTIONS_PER_MINUTE: ${QUEUE_ACTIONS_PER_MINUTE:-12}
       FIRE_ACTIONS_PER_10S: ${FIRE_ACTIONS_PER_10S:-120}
       MAX_WS_PAYLOAD_BYTES: ${MAX_WS_PAYLOAD_BYTES:-4096}
+      FINISHED_MATCH_RETENTION_MS: ${FINISHED_MATCH_RETENTION_MS:-600000}
     expose:
       - "3001"
     volumes:

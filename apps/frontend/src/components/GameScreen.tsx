@@ -25,20 +25,35 @@ import {
 
 export function GameScreen({
   view,
+  connected,
   onPlaceFleet,
   onFire
 }: {
   view: PublicMatchView;
+  connected: boolean;
   onPlaceFleet: (placements: ShipPlacement[]) => void;
   onFire: (cell: PublicCell) => void;
 }) {
   return (
     <main className="app-screen game-screen">
       <MatchHeader view={view} />
-      {view.phase === "placing" ? (
-        <PlacementPhase view={view} onPlaceFleet={onPlaceFleet} />
+      {!connected ? <EightBitAlert tone="warning">Reconnecting. Waiting for the current server state.</EightBitAlert> : null}
+      {view.phase === "saving" || view.phase === "save_failed" ? (
+        <EightBitAlert tone={view.phase === "saving" ? "info" : "danger"}>
+          {view.phase === "saving" ? "Saving match result. Play is locked while storage is retried."
+            : "Saving failed. Play is locked. Please contact the administrator."}
+        </EightBitAlert>
+      ) : view.phase === "placing" ? (
+        view.you.ready ? (
+          <section className="phase-layout">
+            <OceanBoard title="Your Fleet" cells={view.ownBoard} />
+            <aside className="pixel-panel side-panel">
+              <EightBitAlert tone="success">Fleet confirmed. Waiting for the opponent to be ready.</EightBitAlert>
+            </aside>
+          </section>
+        ) : <PlacementPhase connected={connected} onPlaceFleet={onPlaceFleet} />
       ) : (
-        <BattlePhase view={view} onFire={onFire} />
+        <BattlePhase view={view} connected={connected} onFire={onFire} />
       )}
     </main>
   );
@@ -56,7 +71,8 @@ function MatchHeader({ view }: { view: PublicMatchView }) {
       </div>
       <div className="match-status">
         <EightBitBadge tone={view.phase === "playing" ? turnTone : "info"}>
-          {view.phase === "playing" ? (view.currentTurnUserId === view.you.userId ? "Your Turn" : "Opponent Turn") : "Placement"}
+          {view.phase === "saving" ? "Saving" : view.phase === "save_failed" ? "Saving failed"
+            : view.phase === "playing" ? (view.currentTurnUserId === view.you.userId ? "Your Turn" : "Opponent Turn") : "Placement"}
         </EightBitBadge>
         <p>{view.message}</p>
       </div>
@@ -72,10 +88,10 @@ function MatchHeader({ view }: { view: PublicMatchView }) {
 }
 
 function PlacementPhase({
-  view,
+  connected,
   onPlaceFleet
 }: {
-  view: PublicMatchView;
+  connected: boolean;
   onPlaceFleet: (placements: ShipPlacement[]) => void;
 }) {
   const [placements, setPlacements] = useState<ShipPlacement[]>([]);
@@ -131,17 +147,6 @@ function PlacementPhase({
     }
     setLocalError(undefined);
     onPlaceFleet(placements);
-  }
-
-  if (view.you.ready) {
-    return (
-      <section className="phase-layout">
-        <OceanBoard title="Your Fleet" cells={view.ownBoard} />
-        <aside className="pixel-panel side-panel">
-          <EightBitAlert tone="success">Fleet confirmed. Waiting for the opponent to be ready.</EightBitAlert>
-        </aside>
-      </section>
-    );
   }
 
   return (
@@ -208,7 +213,7 @@ function PlacementPhase({
           >
             Reset
           </EightBitButton>
-          <EightBitButton disabled={!allPlaced} onClick={confirm}>
+          <EightBitButton disabled={!allPlaced || !connected} onClick={confirm}>
             Confirm
           </EightBitButton>
         </div>
@@ -219,9 +224,9 @@ function PlacementPhase({
   );
 }
 
-function BattlePhase({ view, onFire }: { view: PublicMatchView; onFire: (cell: PublicCell) => void }) {
+function BattlePhase({ view, connected, onFire }: { view: PublicMatchView; connected: boolean; onFire: (cell: PublicCell) => void }) {
   const isYourTurn = view.currentTurnUserId === view.you.userId;
-  const disabled = !isYourTurn || !view.opponent.connected;
+  const disabled = !connected || !isYourTurn || !view.opponent.connected;
 
   return (
     <section className="battle-layout">

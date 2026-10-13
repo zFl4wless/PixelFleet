@@ -18,8 +18,10 @@ Usage:
 Scopes:
   runtime   Clear queue, active matches, sockets and in-memory rate-limit state.
   sessions  Clear session cookies server-side and runtime state.
-  stats     Reset XP, levels and stats while keeping guest accounts.
+  stats     Reset XP, levels, stats and runtime state while keeping accounts/sessions.
   accounts  Delete all guest accounts and sessions.
+
+All scopes preserve durable match-completion receipts to prevent duplicate rewards.
 `);
   process.exit(exitCode);
 }

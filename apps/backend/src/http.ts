@@ -1,13 +1,14 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { isIP } from "node:net";
+import { PublicInputError } from "./input-errors.js";
 
 const SESSION_COOKIE_NAME = "pf_session";
 const DEFAULT_MAX_JSON_BYTES = 16 * 1024;
 const VITE_DEV_PORTS = new Set(["5173", "5174", "5175", "5176", "5177", "5178", "5179"]);
 
-export class InvalidCookieError extends Error {
+export class InvalidCookieError extends PublicInputError {
   constructor() {
-    super("Invalid cookie encoding.");
+    super("invalid_cookie");
     this.name = "InvalidCookieError";
   }
 }
@@ -177,35 +178,80 @@ export function setCors(req: IncomingMessage, res: ServerResponse): void {
 
   res.setHeader("Access-Control-Allow-Headers", "content-type");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Expose-Headers", "X-Request-ID");
+}
+
+export function canRespond(res: ServerResponse): boolean {
+  return !res.headersSent && !res.writableEnded && !res.destroyed;
 }
 
 export function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  if (!canRespond(res)) return;
+  // Serialize before committing headers so serialization failures can become a 500.
+  const json = JSON.stringify(body);
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify(body));
+  res.end(json);
 }
 
-export async function readJson<T>(req: IncomingMessage, maxBytes = DEFAULT_MAX_JSON_BYTES): Promise<T> {
+function discardBody(req: IncomingMessage): void {
+  // Consume late transport errors while draining an already rejected body.
+  const ignore = () => {};
+  req.on("error", ignore);
+  req.once("close", () => req.off("error", ignore));
+  req.resume();
+}
+
+export function requireJsonObject(value: unknown): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new PublicInputError("invalid_body");
+  return value as Record<string, unknown>;
+}
+
+export async function readJson(req: IncomingMessage, maxBytes = DEFAULT_MAX_JSON_BYTES): Promise<unknown> {
   const contentType = req.headers["content-type"];
-  if (contentType && !contentType.toLowerCase().includes("application/json")) {
-    throw new Error("Expected application/json.");
+  if (contentType?.split(";")[0].trim().toLowerCase() !== "application/json") {
+    discardBody(req);
+    throw new PublicInputError("unsupported_content_type");
+  }
+  if (Number(req.headers["content-length"]) > maxBytes) {
+    discardBody(req);
+    throw new PublicInputError("body_too_large");
   }
 
-  const chunks: Buffer[] = [];
-  let totalBytes = 0;
-
-  for await (const chunk of req) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    totalBytes += buffer.byteLength;
-    if (totalBytes > maxBytes) {
-      throw new Error("Request body is too large.");
-    }
-    chunks.push(buffer);
+  // Unlike early return from an async iterator, rejecting here does not destroy
+  // the request socket before its controlled 413 response can be delivered.
+  const raw = await new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    let settled = false;
+    const settle = (error?: unknown) => {
+      if (settled) return;
+      settled = true;
+      req.off("data", onData); req.off("end", onEnd); req.off("aborted", onAborted);
+      if (error) reject(error);
+      else resolve(Buffer.concat(chunks).toString("utf8"));
+    };
+    const onData = (chunk: Buffer | string) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += buffer.byteLength;
+      if (totalBytes > maxBytes) {
+        settle(new PublicInputError("body_too_large"));
+        req.resume();
+      } else chunks.push(buffer);
+    };
+    const onEnd = () => settle();
+    const onAborted = () => settle(new Error("Request aborted."));
+    const onError = (error: Error) => settle(error);
+    req.on("data", onData); req.once("end", onEnd); req.once("aborted", onAborted);
+    // Retain this listener until close: an abort can emit error after aborted.
+    req.on("error", onError);
+    req.once("close", () => { req.off("error", onError); if (!settled) onAborted(); });
+    if (req.destroyed && !req.complete) onAborted();
+  });
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch (error) {
+    // Classify only a parse failure at this boundary, never arbitrary SyntaxErrors.
+    if (error instanceof SyntaxError) throw new PublicInputError("invalid_json");
+    throw error;
   }
-
-  const raw = Buffer.concat(chunks).toString("utf8");
-  if (!raw) {
-    return {} as T;
-  }
-
-  return JSON.parse(raw) as T;
 }

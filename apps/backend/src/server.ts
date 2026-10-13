@@ -1,9 +1,10 @@
 import { createServer } from "node:http";
-import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { open, stat } from "node:fs/promises";
+import { pipeline } from "node:stream/promises";
 import { extname, join, normalize, sep } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
-import { frontendPageFromPath } from "@pixelfleet/shared";
+import { frontendPageFromPath, WS_PROTOCOL } from "@pixelfleet/shared";
 import {
   closeDatabase,
   createGuestAccount,
@@ -16,20 +17,24 @@ import {
 } from "./db.js";
 import {
   clearSessionCookie,
+  canRespond,
   getClientIp,
   getSessionToken,
   InvalidCookieError,
   isTrustedOrigin,
   isSecureRequest,
   readJson,
+  requireJsonObject,
   sendJson,
   sessionCookie,
   setCors,
   setSecurityHeaders
 } from "./http.js";
-import { GameHub } from "./game-hub.js";
+import { GameHub, MAX_WS_PAYLOAD_BYTES } from "./game-hub.js";
 import { metrics } from "./metrics.js";
-import { FixedWindowRateLimiter, parseEnvInt } from "./rate-limit.js";
+import type { HttpErrorContext } from "./metrics.js";
+import { PublicInputError } from "./input-errors.js";
+import { FixedWindowRateLimiter, parseEnvInt, startRateLimitCleanup } from "./rate-limit.js";
 
 const port = Number(process.env.PORT ?? 3001);
 const hub = new GameHub();
@@ -60,6 +65,10 @@ const wsConnectLimiter = new FixedWindowRateLimiter({
   limit: parseEnvInt("WS_CONNECTS_PER_MINUTE", 30),
   windowMs: 60_000
 });
+const stopRateLimitCleanup = startRateLimitCleanup((now) => {
+  for (const limiter of [publicLimiter, loginLimiter, adminLimiter, wsConnectLimiter]) limiter.prune(now);
+  hub.pruneRateLimits(now);
+});
 const activeWsByIp = new Map<string, number>();
 const maxWsPerIp = parseEnvInt("MAX_WS_PER_IP", 20);
 const noIndexPaths = new Set(["/legal-notice", "/privacy-policy"]);
@@ -75,7 +84,25 @@ const mimeTypes: Record<string, string> = {
 };
 
 function pathname(reqUrl: string | undefined): string {
-  return new URL(reqUrl ?? "/", "http://localhost").pathname;
+  try {
+    return new URL(reqUrl ?? "/", "http://localhost").pathname;
+  } catch {
+    throw new PublicInputError("invalid_url");
+  }
+}
+
+function requestRoute(path: string): HttpErrorContext["route"] {
+  switch (path) {
+    case "/api/health": return "health";
+    case "/api/me": return "me";
+    case "/api/guest-login": return "guest-login";
+    case "/api/logout": return "logout";
+    case "/api/admin/status": return "admin-status";
+    case "/api/admin/metrics": return "admin-metrics";
+    case "/api/admin/reset": return "admin-reset";
+    case "/metrics": return "metrics";
+    default: return path.startsWith("/api/admin") ? "admin-other" : path === "/api" || path.startsWith("/api/") || path.startsWith("/ws") ? "api-other" : "static";
+  }
 }
 
 function isNoIndexPath(path: string): boolean {
@@ -168,33 +195,32 @@ async function handleAdminRoute(
   }
 
   if (req.method === "GET" && path === "/metrics") {
+    const text = metrics.prometheus(metricGauges());
     res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
-    res.end(metrics.prometheus(metricGauges()));
+    res.end(text);
     return true;
   }
 
   if (req.method === "POST" && path === "/api/admin/reset") {
-    const body = await readJson<{ scope?: ResetScope | "runtime" }>(req);
-    const scope = body.scope ?? "runtime";
+    const body = requireJsonObject(await readJson(req));
+    if (!canRespond(res)) return true;
+    const value = body.scope === undefined ? "runtime" : body.scope;
     const allowedScopes = new Set(["accounts", "all", "runtime", "sessions", "stats"]);
 
-    if (!allowedScopes.has(scope)) {
-      sendJson(res, 400, { error: "Invalid reset scope." });
-      return true;
-    }
+    if (typeof value !== "string" || !allowedScopes.has(value)) throw new PublicInputError("invalid_reset_scope");
+    const scope = value as ResetScope | "runtime";
 
     let database = getDatabaseStats();
     if (scope === "runtime") {
       hub.resetRuntime();
     } else {
-      if (scope === "accounts" || scope === "all" || scope === "sessions") {
-        hub.resetRuntime();
-      }
+      // Cancel pending completions and retained profiles before resetting totals too.
+      hub.resetRuntime();
       database = resetDatabase(scope);
     }
 
     metrics.inc("admin_actions_total");
-    metrics.event("admin", `Admin reset executed from ${ip}: ${scope}`);
+    metrics.event("admin", `Admin reset executed: ${scope}`);
     sendJson(res, 200, {
       ok: true,
       scope,
@@ -210,7 +236,9 @@ async function handleAdminRoute(
 
 async function serveStatic(reqUrl: string | undefined, res: import("node:http").ServerResponse): Promise<boolean> {
   const url = new URL(reqUrl ?? "/", "http://localhost");
-  const requestedPath = decodeURIComponent(url.pathname);
+  let requestedPath: string;
+  try { requestedPath = decodeURIComponent(url.pathname); }
+  catch { throw new PublicInputError("invalid_url"); }
 
   if (requestedPath === "/api" || requestedPath.startsWith("/api/") || requestedPath === "/ws" || requestedPath.startsWith("/ws/")) {
     return false;
@@ -235,7 +263,10 @@ async function serveStatic(reqUrl: string | undefined, res: import("node:http").
   } else if (page !== "not-found") {
     filePath = join(frontendDistDir, page, "index.html");
   } else {
-    const fileStat = await stat(safeCandidate).catch(() => null);
+    const fileStat = await stat(safeCandidate).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT" || error.code === "ENOTDIR") return null;
+      throw error;
+    });
     if (fileStat?.isFile() && extname(safeCandidate) !== ".html" && mimeTypes[extname(safeCandidate)]) {
       filePath = safeCandidate;
     } else if (requestedPath.startsWith("/assets/") || (extname(requestedPath) && extname(requestedPath) !== ".html")) {
@@ -249,34 +280,46 @@ async function serveStatic(reqUrl: string | undefined, res: import("node:http").
 
   try {
     await stat(filePath);
-  } catch {
-    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR") return false;
+    throw error;
   }
 
-  res.writeHead(status, {
-    "Content-Type": mimeTypes[extname(filePath)] ?? "application/octet-stream",
-    "Cache-Control": extname(filePath) === ".html" ? "no-cache" : "public, max-age=31536000, immutable",
-    ...(status === 404 || isNoIndexPath(requestedPath) || page === "legal-notice" || page === "privacy-policy"
-      ? { "X-Robots-Tag": "noindex, nofollow, noarchive" } : {})
-  });
-  createReadStream(filePath).pipe(res);
+  // Opening can fail after stat succeeds. Wait before committing response headers.
+  const file = await open(filePath, "r");
+  try {
+    if (!canRespond(res)) return true;
+    res.writeHead(status, {
+      "Content-Type": mimeTypes[extname(filePath)] ?? "application/octet-stream",
+      "Cache-Control": extname(filePath) === ".html" ? "no-cache" : "public, max-age=31536000, immutable",
+      ...(status === 404 || isNoIndexPath(requestedPath) || page === "legal-notice" || page === "privacy-policy"
+        ? { "X-Robots-Tag": "noindex, nofollow, noarchive" } : {})
+    });
+    // Read/response errors and client disconnects are awaited inside the HTTP boundary.
+    await pipeline(file.createReadStream(), res);
+  } finally { await file.close(); }
   return true;
 }
 
 const server = createServer(async (req, res) => {
-  metrics.trackResponse(res);
-  setSecurityHeaders(res);
-  setCors(req, res);
-  const ip = getClientIp(req);
-  const path = pathname(req.url);
-
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
+  const context: HttpErrorContext = { requestId: "", method: undefined, route: "unknown", stage: "preparation", responseState: "unstarted" };
   try {
+    context.requestId = randomUUID();
+    context.method = req.method;
+    metrics.trackResponse(res);
+    res.setHeader("X-Request-ID", context.requestId);
+    setSecurityHeaders(res);
+    setCors(req, res);
+    const ip = getClientIp(req);
+    const path = pathname(req.url);
+    context.route = requestRoute(path);
+    context.stage = "handler";
+
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
     // Container probes must remain available when a visitor hits their rate limit.
     if (req.method === "GET" && path === "/api/health") {
       sendJson(res, shuttingDown ? 503 : 200, {
@@ -293,7 +336,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (!["GET", "HEAD", "OPTIONS"].includes(req.method ?? "GET") && !isTrustedOrigin(req)) {
-      metrics.event("security", `Blocked untrusted origin from ${ip}: ${req.headers.origin ?? "none"}`);
+      metrics.event("security", "Blocked untrusted HTTP origin.");
       sendJson(res, 403, { error: "Untrusted origin." });
       return;
     }
@@ -323,8 +366,10 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      const body = await readJson<{ username?: string }>(req);
-      const username = body.username ?? "";
+      const body = requireJsonObject(await readJson(req));
+      if (!canRespond(res)) return;
+      const username = body.username === undefined ? "" : body.username;
+      if (typeof username !== "string") throw new PublicInputError("invalid_username_type");
       const { profile, sessionToken, expiresAt } = createGuestAccount(username);
       metrics.inc("guest_accounts_created_total");
       res.setHeader("Set-Cookie", sessionCookie(sessionToken, isSecureRequest(req), expiresAt));
@@ -342,19 +387,25 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    context.stage = "static";
     if (await serveStatic(req.url, res)) {
       return;
     }
 
     sendJson(res, 404, { error: "Route not found." });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Server error.";
-    metrics.event("error", message);
-    sendJson(res, 400, { error: message });
+    if (error instanceof PublicInputError) {
+      sendJson(res, error.status, { error: error.message });
+      return;
+    }
+    context.responseState = res.destroyed || res.writableEnded ? "closed" : res.headersSent ? "started" : "unstarted";
+    metrics.httpError(context, error);
+    if (canRespond(res)) sendJson(res, 500, { error: "Internal server error.", requestId: context.requestId });
+    else if (!res.destroyed && !res.writableEnded) res.destroy();
   }
 });
 
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_PAYLOAD_BYTES });
 type HeartbeatSocket = WebSocket & { isAlive?: boolean };
 
 const heartbeatInterval = setInterval(() => {
@@ -369,7 +420,10 @@ const heartbeatInterval = setInterval(() => {
   }
 }, 30_000);
 
-server.on("close", () => clearInterval(heartbeatInterval));
+server.on("close", () => {
+  clearInterval(heartbeatInterval);
+  stopRateLimitCleanup();
+});
 
 function rejectUpgrade(
   socket: import("node:stream").Duplex,
@@ -425,11 +479,6 @@ server.on("upgrade", (req, socket, head) => {
     wss.handleUpgrade(req, socket, head, (ws) => {
       const heartbeatSocket = ws as HeartbeatSocket;
       upgrade.socket = heartbeatSocket;
-      heartbeatSocket.isAlive = true;
-      heartbeatSocket.on("pong", () => {
-        heartbeatSocket.isAlive = true;
-      });
-
       activeWsByIp.set(ip, (activeWsByIp.get(ip) ?? 0) + 1);
       let released = false;
       const releaseConnection = () => {
@@ -445,8 +494,26 @@ server.on("upgrade", (req, socket, head) => {
         }
       };
       upgrade.releaseConnection = releaseConnection;
+      // Install before hub initialization: later protocol errors escape the upgrade catch.
+      let failed = false;
+      heartbeatSocket.on("error", () => {
+        if (failed) return;
+        failed = true;
+        releaseConnection();
+        heartbeatSocket.terminate();
+        metrics.event("error", "WebSocket transport failed");
+      });
       heartbeatSocket.once("close", releaseConnection);
+      heartbeatSocket.isAlive = true;
+      heartbeatSocket.on("pong", () => {
+        heartbeatSocket.isAlive = true;
+      });
 
+      if (ws.protocol !== WS_PROTOCOL) {
+        ws.send(JSON.stringify({ type: "toast", tone: "warning", message: "Pixel Fleet was updated. Reload this page to reconnect." }));
+        ws.close(4002, "Client update required");
+        return;
+      }
       hub.connect(ws, session.profile, { ip, sessionId: session.id, expiresAt: session.expiresAt });
     });
   } catch (error) {
@@ -469,6 +536,7 @@ function shutdown(signal: string): void {
   shuttingDown = true;
   console.log(`Received ${signal}; stopping Pixel Fleet.`);
   clearInterval(heartbeatInterval);
+  stopRateLimitCleanup();
 
   const timeout = setTimeout(() => {
     console.error("Shutdown timed out.");

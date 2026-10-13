@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
-import type { ServerMessage } from "@pixelfleet/shared";
+import { calculateMatchXp, type ServerMessage } from "@pixelfleet/shared";
 import type { GameHub as Hub } from "../apps/backend/src/game-hub";
 import { sessionCookie } from "../apps/backend/src/http";
 import { metrics } from "../apps/backend/src/metrics";
@@ -69,7 +69,9 @@ function existingSession(remainingMs = 1500) {
   const createdAt = new Date(START - YEAR_MS + remainingMs).toISOString();
   fixture.prepare("UPDATE sessions SET created_at = ?, last_seen_at = ? WHERE token_hash = ?")
     .run(createdAt, createdAt, player.id);
-  database.updateStatsAfterMatch(player.profile.userId, { won: true, hits: 3, shotsFired: 5, shipsSunk: 1 });
+  // Seed an established profile; match rewards can only be written as a whole completion.
+  fixture.prepare("UPDATE users SET xp = ?, wins = 1, games_played = 1, hits = 3, shots_fired = 5, ships_sunk = 1 WHERE user_id = ?")
+    .run(calculateMatchXp({ won: true, hits: 3, shotsFired: 5, shipsSunk: 1 }), player.profile.userId);
   return { ...player, profile: database.getProfile(player.profile.userId)!, createdAt, expiresAt: START + remainingMs };
 }
 
@@ -245,6 +247,61 @@ describe("expiry of derived WebSocket permissions", () => {
     expect(socket.closes).toEqual([]);
     expect(database.getProfile(player.profile.userId)).toEqual(player.profile);
     expect(sessionRow(player.id).created_at).toBe(player.createdAt);
+  });
+
+  it.each(["error-first", "close-first"])("cleans up %s events once and ignores late errors after replacement", (order) => {
+    const player = existingSession();
+    const old = connect(player);
+    old.message({ type: "join_queue" });
+    expect(vi.getTimerCount()).toBe(1);
+    if (order === "close-first") old.finishClose();
+    expect(() => old.emit("error", new Error("Transport failure"))).not.toThrow();
+    expect(() => old.emit("error", new Error("Repeated transport failure"))).not.toThrow();
+    old.finishClose();
+    old.finishClose();
+    expect(hub.stats()).toMatchObject({ activeConnections: 0, queuedPlayers: 0 });
+    expect(vi.getTimerCount()).toBe(0);
+    const current = connect(player);
+    old.emit("error", new Error("Late transport failure"));
+    old.finishClose();
+    expect(hub.stats().activeConnections).toBe(1);
+    expect(vi.getTimerCount()).toBe(1);
+    expect(current.closes).toEqual([]);
+    vi.advanceTimersByTime(1500);
+    expect(current.closes).toEqual([{ code: 4003, reason: "Session revoked" }]);
+    expect(old.closes).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("starts one reconnect grace timer on error and preserves a recovered match through late error/close events", () => {
+    const first = guest();
+    const second = guest();
+    const old = connect(first);
+    const opponent = connect(second);
+    old.message({ type: "join_queue" });
+    opponent.message({ type: "join_queue" });
+    expect(vi.getTimerCount()).toBe(2);
+    expect(() => old.emit("error", new Error("Match transport failure"))).not.toThrow();
+    const updates = opponent.sent.length;
+    expect(vi.getTimerCount()).toBe(2); // One session expiry and one reconnect timer.
+    old.emit("error", new Error("Repeated match transport failure"));
+    old.finishClose();
+    expect(opponent.sent).toHaveLength(updates);
+    expect(vi.getTimerCount()).toBe(2);
+    const current = connect(first);
+    old.emit("error", new Error("Late old socket failure"));
+    old.finishClose();
+    expect(vi.getTimerCount()).toBe(2); // Both current session expiry timers only.
+    vi.advanceTimersByTime(30_001);
+    expect(hub.stats()).toMatchObject({ activeConnections: 2, placingMatches: 1, finishedMatches: 0 });
+    current.emit("error", new Error("Final transport failure"));
+    current.finishClose();
+    current.emit("error", new Error("Late final transport failure"));
+    vi.advanceTimersByTime(30_001);
+    expect(hub.stats().finishedMatches).toBe(1);
+    expect(database.getProfile(first.profile.userId)?.stats.gamesPlayed).toBe(1);
+    expect(database.getProfile(second.profile.userId)?.stats.gamesPlayed).toBe(1);
+    expect(vi.getTimerCount()).toBe(2); // Opponent session expiry and bounded result retention.
   });
 
   it("clears replacement timers and does not let a queued old callback revoke the current connection", () => {
