@@ -45,7 +45,7 @@ The release gate is part of the Dockerfile, rather than a separate optional CI
 job. Both the default Docker build and Compose's explicit `build.target: runtime`
 depend on this sequence:
 
-1. Node **24** (`node:24-bookworm-slim`), with all workspace dependencies installed
+1. Node **24.22.1** (`node:24.22.1-bookworm-slim`), with all workspace dependencies installed
    from `package-lock.json` by `npm ci`.
 2. `npm run verify`: the complete `npm test` suite, root `npm run typecheck`, then
    `npm run build`. Each command must succeed before the next runs. Tests are now
@@ -73,24 +73,27 @@ depend on this sequence:
 Supported commands from the repository root:
 
 ```bash
-# Optional fast source check outside Docker; use Node 24.15+ for the DOM tests.
+# Optional fast source check outside Docker; use Node 24.22.1+ within 24.x.
 npm ci
 npm run verify
 
 # Complete required image gate; neither command deploys anything.
-docker build --progress=plain --target runtime -t pixelfleet:checked .
-docker compose --progress plain build pixelfleet
+docker build --pull --progress=plain --target runtime -t pixelfleet:checked .
+docker compose --progress plain build --pull pixelfleet
 
 # Re-run all steps instead of reusing successful checks for identical inputs.
-docker compose --progress plain build --no-cache pixelfleet
+docker compose --progress plain build --pull --no-cache pixelfleet
 ```
 
 BuildKit is required for the stage mounts and network isolation. It fails the
 build if unsupported; there is no fallback that skips checks. Normal build caching
 can reuse successful steps for identical inputs. Source, tests, manifests, lockfile,
 public build arguments and check-script changes invalidate their dependent checks.
-The lockfile fixes npm dependency resolution; the Node 24 base tag still receives
-patch updates, so this is not a claim of bit-identical images across base updates.
+The lockfile fixes npm dependency resolution; the Node version is pinned in both
+base stages. Tags can still be republished and Debian/browser preparation uses
+external package repositories, so this is not a claim of bit-identical images.
+`--pull` refreshes base-image metadata; `--no-cache` alone does not. See the
+[Node security update runbook](node-security-update.md) for deployment and rollback.
 
 Do not deploy intermediate targets (`build`, `browser-tools`, `browser-check`,
 `runtime-base`, `runtime-check`), use
@@ -377,7 +380,7 @@ fleets remain available if the server process and match are still alive.
 
 The existing Docker gate now includes real React DOM mount tests via the development
 dependency `jsdom` (pinned in the lockfile). For local source verification use Node
-**24.15 or newer in the 24.x line**; the checked Node 24 Docker base satisfies this.
+**24.22.1 or newer in the 24.x line**; the checked Node 24 Docker base satisfies this.
 `npm ci --omit=dev` keeps jsdom, its dependencies and test files out of the runtime.
 The smoke client only changed protocol selection and waits for the initial snapshot;
 it still plays the same complete match. TD-08 adds the development-only browser
@@ -513,7 +516,7 @@ not mock frames, invoke application actions or require production test endpoints
 
 ### Local preparation and commands
 
-Use Node **24.15+ within 24.x**, from the repository root:
+Use Node **24.22.1+ within 24.x**, from the repository root:
 
 ```bash
 npm ci
@@ -685,7 +688,7 @@ TEST
 
 ## Dependency maintenance (TD-09)
 
-Use Node 24.15+ within 24.x and `npm ci` against the committed lockfile. Security
+Use Node 24.22.1+ within 24.x and `npm ci` against the committed lockfile. Security
 updates must include development/build/test dependencies: they run on developer
 machines and in the builder even though they are absent from the runtime image.
 The TD-09 advisory inventory, primary sources and version decisions are recorded in

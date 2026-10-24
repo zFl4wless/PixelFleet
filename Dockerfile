@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM node:24-bookworm-slim AS manifests
+FROM node:24.22.1-bookworm-slim AS manifests
 WORKDIR /app
 
 COPY package.json package-lock.json ./
@@ -50,7 +50,7 @@ RUN --network=none --mount=type=tmpfs,target=/tmp \
 FROM manifests AS production-dependencies
 RUN npm ci --omit=dev --workspace=apps/backend --workspace=packages/shared --no-audit --no-fund
 
-FROM node:24-bookworm-slim AS runtime-base
+FROM node:24.22.1-bookworm-slim AS runtime-base
 WORKDIR /app
 ENV NODE_ENV=production \
     PORT=3001 \
