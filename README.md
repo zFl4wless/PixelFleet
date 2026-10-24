@@ -33,7 +33,8 @@ tests             Vitest coverage for game and server behavior
 
 ## Getting Started
 
-Pixel Fleet requires Node.js 24 or newer.
+Pixel Fleet requires Node.js 24.22.1 or newer. Production builds and runs on
+`node:24.22.1-bookworm-slim` (Node 24, Debian Bookworm Slim).
 
 ```bash
 npm ci
@@ -113,6 +114,7 @@ Run exactly one instance; active matches are kept in memory and end on redeploym
 
 See [the Dokploy deployment guide](docs/dokploy.md) for the complete setup, DNS,
 configuration, backup/restore, and verification steps.
+For the Node.js security update, follow the [deployment and rollback runbook](docs/node-security-update.md).
 
 The production build emits static `/legal-notice/` and `/privacy-policy/` HTML shells with `noindex` robots metadata.
 The Node production server also sends `X-Robots-Tag: noindex, nofollow, noarchive` for `/legal-notice` and
